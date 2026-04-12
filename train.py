@@ -55,6 +55,7 @@ from irodori_tts.rf import (
     sample_logit_normal_t,
     sample_stratified_logit_normal_t,
 )
+from irodori_tts.text_normalization import normalize_text
 from irodori_tts.tokenizer import PretrainedTextTokenizer
 
 WANDB_MODES = {"online", "offline", "disabled"}
@@ -1185,6 +1186,53 @@ def load_preview_reference_image(image_path: str | None):
     return load_character_image(Path(image_path_str).expanduser())
 
 
+def normalize_preview_text(text: str) -> str:
+    """Normalize preview text with the same rules used by runtime inference."""
+    return normalize_text(str(text)).strip()
+
+
+def resolve_preview_condition_lengths(train_cfg: TrainConfig) -> tuple[int, int]:
+    """Resolve preview token limits using the same fallback rules as inference."""
+    text_max_len = int(train_cfg.max_text_len)
+    caption_max_len = text_max_len
+    if train_cfg.max_caption_len is not None:
+        caption_max_len = int(train_cfg.max_caption_len)
+    return text_max_len, caption_max_len
+
+
+def resolve_preview_sequence_lengths(
+    *,
+    seconds: float,
+    sample_rate: int,
+    hop_length: int,
+    latent_patch_size: int,
+) -> tuple[int, int, int]:
+    """Resolve preview decode/sample lengths using inference-runtime style ceil rules."""
+    target_samples = int(float(seconds) * sample_rate)
+    latent_steps = max(1, -(-target_samples // int(hop_length)))
+    patched_steps = max(1, -(-latent_steps // int(latent_patch_size)))
+    return target_samples, latent_steps, patched_steps
+
+
+def decode_preview_audio(
+    *,
+    z_patched: torch.Tensor,
+    model_cfg: ModelConfig,
+    codec: DACVAECodec,
+    latent_steps: int,
+    target_samples: int,
+) -> torch.Tensor:
+    """Decode preview latents with the same latent/audio cropping rules as runtime."""
+    z = unpatchify_latent(
+        z_patched,
+        patch_size=model_cfg.latent_patch_size,
+        latent_dim=model_cfg.latent_dim,
+    )
+    z = z[:, :latent_steps]
+    audio = codec.decode_latent(z)
+    return audio[..., :target_samples]
+
+
 def log_preview_reference_images(
     *,
     samples: list[PreviewSampleConfig],
@@ -1216,6 +1264,7 @@ def run_preview(
     *,
     model,
     model_cfg: ModelConfig,
+    train_cfg: TrainConfig,
     samples: list[PreviewSampleConfig],
     codec: DACVAECodec,
     device: torch.device,
@@ -1230,13 +1279,17 @@ def run_preview(
     was_training = model.training
     model.eval()
     audio_logs: dict = {}
+    text_max_len, caption_max_len = resolve_preview_condition_lengths(train_cfg)
 
     with torch.no_grad():
         for i, cfg in enumerate(samples):
             try:
                 # 1. Tokenize text
+                normalized_text = normalize_preview_text(cfg.text)
+                if normalized_text == "":
+                    raise ValueError("preview text became empty after normalization")
                 text_ids, text_mask = tokenizer.batch_encode(
-                    [cfg.text], max_length=model_cfg.text_dim
+                    [normalized_text], max_length=text_max_len
                 )
                 text_ids = text_ids.to(device)
                 text_mask = text_mask.to(device)
@@ -1245,12 +1298,12 @@ def run_preview(
                 caption_ids = None
                 caption_mask = None
                 if model_cfg.use_caption_condition and caption_tokenizer is not None:
-                    caption_text = cfg.caption if cfg.caption else ""
+                    caption_text = "" if cfg.caption is None else str(cfg.caption).strip()
                     caption_ids, caption_mask = caption_tokenizer.batch_encode(
-                        [caption_text], max_length=512
+                        [caption_text], max_length=caption_max_len
                     )
                     if not caption_text.strip():
-                        caption_mask = caption_mask * 0
+                        caption_mask.zero_()
                     caption_ids = caption_ids.to(device)
                     caption_mask = caption_mask.to(device)
 
@@ -1288,10 +1341,13 @@ def run_preview(
                 seconds = cfg.seconds
                 if seconds is None:
                     # Estimate from text length: ~5 chars/sec for Japanese, 1s padding
-                    seconds = max(2.0, len(cfg.text) / 5.0 + 1.0)
-                target_samples = int(seconds * codec.sample_rate)
-                latent_steps = target_samples // int(codec.model.hop_length)
-                seq_len = max(1, -(-latent_steps // model_cfg.latent_patch_size))  # ceil div
+                    seconds = max(2.0, len(normalized_text) / 5.0 + 1.0)
+                target_samples, latent_steps, seq_len = resolve_preview_sequence_lengths(
+                    seconds=seconds,
+                    sample_rate=codec.sample_rate,
+                    hop_length=int(codec.model.hop_length),
+                    latent_patch_size=model_cfg.latent_patch_size,
+                )
 
                 # 6. Sample
                 with (
@@ -1326,18 +1382,21 @@ def run_preview(
                     )
 
                 # 7. Decode
-                z = unpatchify_latent(
-                    z_patched,
-                    patch_size=model_cfg.latent_patch_size,
-                    latent_dim=model_cfg.latent_dim,
+                audio = decode_preview_audio(
+                    z_patched=z_patched,
+                    model_cfg=model_cfg,
+                    codec=codec,
+                    latent_steps=latent_steps,
+                    target_samples=target_samples,
                 )
-                audio = codec.decode_latent(z)  # (B, 1, samples)
                 audio_np = audio[0, 0].cpu().float().numpy()
 
                 key = f"preview/audio_{i}"
                 try:
                     audio_logs[key] = wandb.Audio(
-                        audio_np, sample_rate=codec.sample_rate, caption=cfg.text[:120]
+                        audio_np,
+                        sample_rate=codec.sample_rate,
+                        caption=normalized_text[:120],
                     )
                 except Exception:
                     pass
@@ -2739,6 +2798,7 @@ def main() -> None:
                     run_preview(
                         model=raw_model,
                         model_cfg=model_cfg,
+                        train_cfg=train_cfg,
                         samples=parsed_previews,
                         codec=preview_codec,
                         device=device,
