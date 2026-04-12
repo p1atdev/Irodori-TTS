@@ -17,7 +17,7 @@ from typing import Any
 
 import torch
 import torch.multiprocessing as mp
-from datasets import Audio, load_dataset
+from datasets import Audio, load_dataset, load_from_disk
 from tqdm import tqdm
 
 from irodori_tts.codec import DACVAECodec
@@ -32,6 +32,51 @@ def _coerce_text(value: Any) -> str:
     if isinstance(value, (list, tuple)):
         return " ".join(str(x) for x in value)
     return str(value)
+
+
+def _coerce_optional_path_text(value: Any, *, column_name: str) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        if "path" in value:
+            return _coerce_optional_path_text(value["path"], column_name=column_name)
+        keys = ", ".join(sorted(str(k) for k in value.keys()))
+        raise ValueError(
+            f"Image column '{column_name}' must contain a path-like value or dict with 'path', got keys: {keys}"
+        )
+    if isinstance(value, os.PathLike):
+        text = os.fspath(value)
+    elif isinstance(value, str):
+        text = value
+    else:
+        raise ValueError(
+            f"Image column '{column_name}' must contain a filesystem path string, got {type(value).__name__}."
+        )
+    text = text.strip()
+    return text or None
+
+
+def _validate_image_path(value: Any, *, column_name: str) -> str | None:
+    raw_path = _coerce_optional_path_text(value, column_name=column_name)
+    if raw_path is None:
+        return None
+
+    image_path = Path(raw_path).expanduser()
+    if not image_path.is_absolute():
+        raise ValueError(
+            f"Image column '{column_name}' must contain an absolute path, got: {raw_path}"
+        )
+
+    resolved_image_path = image_path.resolve(strict=False)
+    if not resolved_image_path.exists():
+        raise ValueError(
+            f"Image path from column '{column_name}' does not exist: {resolved_image_path}"
+        )
+    if not resolved_image_path.is_file():
+        raise ValueError(
+            f"Image path from column '{column_name}' is not a file: {resolved_image_path}"
+        )
+    return str(resolved_image_path)
 
 
 def _sanitize_id_component(value: Any, *, fallback: str) -> str:
@@ -173,6 +218,7 @@ class _PreparedItem:
     status: str  # "ok", "skip", "error"
     text: str | None = None
     caption: str | None = None
+    image_path: str | None = None
     wav: torch.Tensor | None = None
     sample_rate: int | None = None
     speaker_id: str | None = None
@@ -197,6 +243,21 @@ def _prepare_example(
         if args.caption_column is not None:
             caption = _coerce_text(sample.get(args.caption_column, ""))
             caption = caption.strip() or None
+
+        image_path = None
+        if args.image_column is not None:
+            try:
+                image_path = _validate_image_path(
+                    sample.get(args.image_column, None),
+                    column_name=args.image_column,
+                )
+            except ValueError as exc:
+                return _PreparedItem(
+                    idx=idx,
+                    status="skip",
+                    skip_reason="invalid_image_path",
+                    error=str(exc),
+                )
 
         if not text:
             return _PreparedItem(idx=idx, status="skip", skip_reason="empty_text")
@@ -243,6 +304,7 @@ def _prepare_example(
             status="ok",
             text=text,
             caption=caption,
+            image_path=image_path,
             wav=wav,
             sample_rate=sr,
             speaker_id=speaker_id,
@@ -494,15 +556,20 @@ def _run_worker(
     latent_dir = Path(args.latent_dir).expanduser().resolve()
     latent_dir.mkdir(parents=True, exist_ok=True)
 
-    ds = load_dataset(
-        path=args.dataset,
-        name=args.config,
-        split=args.split,
-        data_files=_parse_data_files(args.data_files),
-        cache_dir=args.cache_dir,
-        trust_remote_code=args.trust_remote_code,
-        streaming=args.streaming,
-    )
+    if os.path.exists(args.dataset) and os.path.isdir(args.dataset):
+        ds = load_from_disk(
+            dataset_path=args.dataset,
+        )
+    else:
+        ds = load_dataset(
+            path=args.dataset,
+            name=args.config,
+            split=args.split,
+            data_files=_parse_data_files(args.data_files),
+            cache_dir=args.cache_dir,
+            trust_remote_code=args.trust_remote_code,
+            streaming=args.streaming,
+        )
 
     if args.audio_column not in ds.column_names:
         raise ValueError(f"audio column '{args.audio_column}' not found: {ds.column_names}")
@@ -510,6 +577,8 @@ def _run_worker(
         raise ValueError(f"text column '{args.text_column}' not found: {ds.column_names}")
     if args.caption_column is not None and args.caption_column not in ds.column_names:
         raise ValueError(f"caption column '{args.caption_column}' not found: {ds.column_names}")
+    if args.image_column is not None and args.image_column not in ds.column_names:
+        raise ValueError(f"image column '{args.image_column}' not found: {ds.column_names}")
     if args.speaker_columns:
         missing_speaker_columns = [c for c in args.speaker_columns if c not in ds.column_names]
         if missing_speaker_columns:
@@ -641,6 +710,7 @@ def _run_worker(
         sr = item.sample_rate
         text = item.text
         caption = item.caption
+        image_path = item.image_path
         speaker_id = item.speaker_id
         if wav is None or sr is None or text is None:
             _inc_skip("prepare_error")
@@ -669,6 +739,8 @@ def _run_worker(
         }
         if caption is not None:
             payload["caption"] = caption
+        if image_path is not None:
+            payload["image_path"] = image_path
         if speaker_id is not None:
             payload["speaker_id"] = speaker_id
         out_f.write(json.dumps(payload, ensure_ascii=False) + "\n")
@@ -777,6 +849,14 @@ def main() -> None:
         "--caption-column",
         default=None,
         help="Optional caption/style-control text column name. Output manifest key is always 'caption'.",
+    )
+    parser.add_argument(
+        "--image-column",
+        default=None,
+        help=(
+            "Optional image path column name. If set, values must be absolute paths to "
+            "existing files and will be written to the manifest as 'image_path'."
+        ),
     )
     parser.add_argument(
         "--speaker-column",

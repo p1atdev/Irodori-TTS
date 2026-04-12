@@ -23,11 +23,9 @@
 ```
 HuggingFace Dataset (音声 + テキスト)
   ↓
-prepare_manifest.py  ←  音声を DACVAE でエンコード → .pt ファイル
+prepare_manifest.py  ←  音声を DACVAE でエンコード / 必要なら image_path も転記 → .pt ファイル
   ↓
 train_manifest.jsonl + latents/*.pt
-  ↓
-（Character Reference を使う場合）image_path を JSONL に追加
   ↓
 train.py  ←  configs/*.yaml
   ↓
@@ -49,7 +47,7 @@ checkpoint .pt / .safetensors
 | `text` | string | ✅ | 学習テキスト（日本語） |
 | `latent_path` | string | ✅ | DACVAE latent `.pt` ファイルへの相対パス |
 | `num_frames` | integer | ✅ | latent のフレーム数 |
-| `speaker_id` | string | — | 話者 ID（例: `myorg/dataset:speaker_001`） |
+| `speaker_id` | string | — | 話者 ID（例: `myorg/dataset:speaker_001`）。同一話者の別発話を参照するために使われます |
 | `caption` | string | — | スタイル制御キャプション（VoiceDesign 用） |
 | `image_path` | string | — | キャラクター参照画像へのパス（Character Reference 用） |
 
@@ -150,10 +148,29 @@ uv run python prepare_manifest.py \
 |---|---|---|
 | `--audio-column` | — | 音声カラム名（必須） |
 | `--text-column` | — | テキストカラム名（必須） |
-| `--speaker-column` | — | 話者 ID カラム名（複数指定可） |
+| `--image-column` | — | 画像パスカラム名。値は絶対パスかつ実在ファイルである必要があり、manifest の `image_path` にそのまま書き出されます |
+| `--speaker-column` | — | 話者 ID カラム名（複数指定可）。ここから出力マニフェストの `speaker_id` を生成します |
 | `--caption-column` | — | キャプションカラム名（VoiceDesign 用） |
 | `--text-normalize` | True | 日本語テキストの正規化 |
 | `--speaker-id-prefix` | データセット名 | 話者 ID のプレフィックス |
+
+### `--speaker-column` は何に使われる？
+
+`prepare_manifest.py` では、`--speaker-column` で指定したカラム値から各サンプルの `speaker_id` を生成して JSONL に保存します。
+
+- 1 カラム指定した場合は、その値をもとに `speaker_id` を作ります
+- 複数カラム指定した場合は、それらを連結して 1 つの `speaker_id` にします
+- 指定したカラムがあっても、その行の値が空ならそのサンプルは残しつつ `speaker_id` だけ省略されます
+
+この `speaker_id` は、**話者条件付き学習**で「同じ話者の別発話」を探すために使われます。学習時には、同じ `speaker_id` を持つ別サンプルの latent を `ref_latent` として参照し、話者特徴の条件付けに使います。
+
+つまり、`--speaker-column` は以下のように考えるとわかりやすいです。
+
+- **`configs/train_500m_v2.yaml` のような話者条件付きモデルでは重要**
+  - 省略しても学習自体は動きます
+  - ただし `speaker_id` が無いので同一話者参照ができず、話者条件付けの効果は使えません
+- **VoiceDesign (`use_caption_condition: true`) や Character Reference (`use_character_condition: true`) では通常不要**
+  - これらの設定では speaker conditioning が無効になるため、`speaker_column` を入れなくても問題ありません
 
 #### 音声処理
 
@@ -207,21 +224,43 @@ uv run python prepare_manifest.py \
 
 ### Character Reference 用（画像付き）
 
-現状の `prepare_manifest.py` は **音声 → latent 変換用ツール**で、`image_path` を自動で抽出・保存する機能はありません。
-そのため、画像条件付き学習を行う場合は以下の流れになります。
+`prepare_manifest.py` に `--image-column` を指定すると、データセット中の画像パス列を **`image_path`** として manifest に転記できます。
 
-1. `prepare_manifest.py` で通常どおり latent 付き JSONL を生成する
-2. 生成された JSONL に `image_path` フィールドを追加する
+このとき、各サンプルの画像パスは次の条件を満たす必要があります。
+
+- **絶対パス**であること
+- **実在するファイル**であること
+
+条件を満たさない場合、そのサンプルはスキップされます。
+
+画像条件付き学習を行う場合の基本フローは次のとおりです。
+
+1. 元データセット側に、絶対パスの画像カラムを用意する
+2. `prepare_manifest.py --image-column ...` で latent 付き JSONL を生成する
 3. `configs/train_500m_v2_character.yaml` など、画像条件付き設定で学習する
 
-たとえば、生成後の JSONL を次のように編集します。
+たとえば、元データセットに `image_path` カラムがある場合は次のように実行します。
 
-```jsonl
-{"text": "こんにちは。", "latent_path": "data/latents/00000000.pt", "num_frames": 300, "image_path": "images/char_a.png"}
-{"text": "今日はよろしくね。", "latent_path": "data/latents/00000001.pt", "num_frames": 360, "image_path": "images/char_a.png"}
+```bash
+uv run python prepare_manifest.py \
+  --dataset myorg/my_dataset \
+  --split train \
+  --audio-column audio \
+  --text-column text \
+  --image-column image_path \
+  --output-manifest data/train_manifest.jsonl \
+  --latent-dir data/latents \
+  --device cuda
 ```
 
-> `image_path` はマニフェストからの相対パスで書けるので、`data/train_manifest.jsonl` に対して `images/char_a.png` のように置いておくと扱いやすいです。
+出力 manifest には次のように `image_path` が追加されます。
+
+```jsonl
+{"text": "こんにちは。", "latent_path": "data/latents/00000000.pt", "num_frames": 300, "image_path": "/datasets/char_refs/char_a.png"}
+{"text": "今日はよろしくね。", "latent_path": "data/latents/00000001.pt", "num_frames": 360, "image_path": "/datasets/char_refs/char_a.png"}
+```
+
+> `prepare_manifest.py` 経由で書かれる `image_path` は絶対パスです。必要なら、生成後に相対パスへ変換して運用しても構いません。
 
 ---
 
