@@ -63,4 +63,8 @@ skip-magic-trailing-comma = false
 line-ending = "auto"
 
 [dependency-groups]
-dev = ["ruff>=0.15.2", "ty>=0.0.29"]
+dev = [
+    "pytest>=9.0.3",
+    "ruff>=0.15.2",
+    "ty>=0.0.29",
+]

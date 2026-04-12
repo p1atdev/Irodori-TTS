@@ -13,7 +13,8 @@
 5. [設定ファイル (YAML)](#設定ファイル-yaml)
 6. [LoRA ファインチューニング](#lora-ファインチューニング)
 7. [VoiceDesign（キャプション条件付き）学習](#voicedesignキャプション条件付き学習)
-8. [マルチ GPU 学習](#マルチ-gpu-学習)
+8. [Character Reference（画像条件付き）学習](#character-reference画像条件付き学習)
+9. [マルチ GPU 学習](#マルチ-gpu-学習)
 
 ---
 
@@ -21,13 +22,15 @@
 
 ```
 HuggingFace Dataset (音声 + テキスト)
-        ↓
+  ↓
 prepare_manifest.py  ←  音声を DACVAE でエンコード → .pt ファイル
-        ↓
+  ↓
 train_manifest.jsonl + latents/*.pt
-        ↓
+  ↓
+（Character Reference を使う場合）image_path を JSONL に追加
+  ↓
 train.py  ←  configs/*.yaml
-        ↓
+  ↓
 checkpoint .pt / .safetensors
 ```
 
@@ -48,12 +51,15 @@ checkpoint .pt / .safetensors
 | `num_frames` | integer | ✅ | latent のフレーム数 |
 | `speaker_id` | string | — | 話者 ID（例: `myorg/dataset:speaker_001`） |
 | `caption` | string | — | スタイル制御キャプション（VoiceDesign 用） |
+| `image_path` | string | — | キャラクター参照画像へのパス（Character Reference 用） |
 
 #### サンプル
 
 ```jsonl
 {"text": "こんにちは、今日はいい天気ですね。", "latent_path": "data/latents/00000000.pt", "num_frames": 420, "speaker_id": "myorg/my_dataset:speaker_001"}
 {"text": "音声合成モデルの学習を行います。", "latent_path": "data/latents/00000001.pt", "num_frames": 510, "speaker_id": "myorg/my_dataset:speaker_002", "caption": "落ち着いた、近い距離感の女性話者"}
+{"text": "おはようございます。", "latent_path": "data/latents/00000002.pt", "num_frames": 380, "image_path": "images/char_a/front.png"}
+{"text": "今日も一日がんばりましょう。", "latent_path": "data/latents/00000003.pt", "num_frames": 460, "image_path": "/mnt/datasets/char_refs/char_a/front.png"}
 ```
 
 ### ディレクトリ構成
@@ -63,6 +69,9 @@ data/
 ├── train_manifest.jsonl          # メインのマニフェスト
 ├── train_manifest.rank00.jsonl   # マルチ GPU 時：ランクごとのシャード
 ├── train_manifest.rank01.jsonl
+├── images/
+│   ├── char_a/front.png          # Character Reference 用の参照画像（任意）
+│   └── char_b/main.webp
 └── latents/
     ├── 00000000_00000000.pt      # DACVAE latent（形状: T × 32）
     ├── 00000001_00000001.pt
@@ -77,6 +86,30 @@ data/
 | 形状 | `(T, 32)`（T: フレーム数、32: 潜在次元） |
 | コーデック | [Aratako/Semantic-DACVAE-Japanese-32dim](https://huggingface.co/Aratako/Semantic-DACVAE-Japanese-32dim) |
 | ラウドネス正規化 | デフォルト -16 dB |
+
+### Character Reference 用の画像フィールド
+
+画像条件付き学習では、各サンプルに **`image_path`** を追加します。
+
+- `image_path` は **1 サンプルにつき 1 つの画像パス**です
+- **絶対パス**、または **マニフェストファイルからの相対パス**が使えます
+- 同じキャラクター画像を複数発話で使いたい場合は、各行で同じ `image_path` を繰り返し指定します
+- 読み込み時に PIL で開いて **RGB に変換**されます（RGBA 画像でも alpha は落として RGB 化）
+- 学習時のテンソル化・リサイズは `character_encoder_model` の推奨 transform と `character_image_size` に従って行われます
+
+#### 画像が無い / 読み込めない場合の挙動
+
+- `image_path` が空文字または未指定なら、そのサンプルは **画像なし**として扱われます
+- 画像ファイルの読み込みに失敗した場合も、学習は止めずに **ゼロ画像へフォールバック**します
+- 学習時には `train.character_unconditional_fill` に応じて、画像なしサンプルや条件ドロップ時の入力を `zero` / `randn` / `rand` で埋めます
+
+#### 最小の Character Reference マニフェスト例
+
+```jsonl
+{"text": "こんにちは。", "latent_path": "latents/00000000.pt", "num_frames": 300, "image_path": "images/char_a.png"}
+{"text": "よろしくお願いします。", "latent_path": "latents/00000001.pt", "num_frames": 340, "image_path": "images/char_a.png"}
+{"text": "別キャラクターです。", "latent_path": "latents/00000002.pt", "num_frames": 310, "image_path": "images/char_b.png"}
+```
 
 ---
 
@@ -171,6 +204,24 @@ uv run python prepare_manifest.py \
   --latent-dir data/latents \
   --device cuda
 ```
+
+### Character Reference 用（画像付き）
+
+現状の `prepare_manifest.py` は **音声 → latent 変換用ツール**で、`image_path` を自動で抽出・保存する機能はありません。
+そのため、画像条件付き学習を行う場合は以下の流れになります。
+
+1. `prepare_manifest.py` で通常どおり latent 付き JSONL を生成する
+2. 生成された JSONL に `image_path` フィールドを追加する
+3. `configs/train_500m_v2_character.yaml` など、画像条件付き設定で学習する
+
+たとえば、生成後の JSONL を次のように編集します。
+
+```jsonl
+{"text": "こんにちは。", "latent_path": "data/latents/00000000.pt", "num_frames": 300, "image_path": "images/char_a.png"}
+{"text": "今日はよろしくね。", "latent_path": "data/latents/00000001.pt", "num_frames": 360, "image_path": "images/char_a.png"}
+```
+
+> `image_path` はマニフェストからの相対パスで書けるので、`data/train_manifest.jsonl` に対して `images/char_a.png` のように置いておくと扱いやすいです。
 
 ---
 
@@ -287,6 +338,7 @@ uv run python train.py \
 |---|---|
 | [configs/train_500m_v2.yaml](configs/train_500m_v2.yaml) | 500M v2 ベースモデル（話者条件付き） |
 | [configs/train_500m_v2_lora.yaml](configs/train_500m_v2_lora.yaml) | 500M v2 LoRA ファインチューニング |
+| [configs/train_500m_v2_character.yaml](configs/train_500m_v2_character.yaml) | 500M v2 Character Reference（画像条件付き） |
 | [configs/train_500m_v2_voice_design.yaml](configs/train_500m_v2_voice_design.yaml) | 500M v2 VoiceDesign（キャプション条件付き） |
 | [configs/train_500m_v2_voice_design_lora.yaml](configs/train_500m_v2_voice_design_lora.yaml) | 500M v2 VoiceDesign LoRA ファインチューニング |
 
@@ -402,6 +454,65 @@ uv run python train.py \
 | `caption_warmup` | キャプションなしのウォームアップを行うか |
 | `caption_warmup_steps` | キャプションウォームアップのステップ数 |
 | `caption_condition_dropout` | キャプション条件付けのドロップアウト率 |
+
+---
+
+## Character Reference（画像条件付き）学習
+
+画像を参照にして声質・スタイルを寄せたい場合は、マニフェストの各行に `image_path` を追加し、Character Reference 用の設定を使って学習します。
+
+### マニフェスト準備
+
+最小構成では、各行に `image_path` を持たせます。
+
+```jsonl
+{"text": "こんにちは。", "latent_path": "data/latents/00000000.pt", "num_frames": 300, "image_path": "images/char_a.png"}
+{"text": "本日はよろしくお願いします。", "latent_path": "data/latents/00000001.pt", "num_frames": 420, "image_path": "images/char_a.png"}
+```
+
+ポイント:
+
+- `image_path` は **絶対パス**でも **マニフェスト基準の相対パス**でもよい
+- 画像 1 枚を複数発話に使い回す場合は、同じ `image_path` を複数行に書く
+- `use_character_condition: true` のときは `speaker_condition` は無効化されます
+
+### 学習実行
+
+```bash
+uv run python train.py \
+  --config configs/train_500m_v2_character.yaml \
+  --manifest data/train_manifest.jsonl \
+  --output-dir outputs/irodori_tts_character
+```
+
+### Character Reference 固有の設定
+
+| パラメータ | 説明 |
+|---|---|
+| `use_character_condition: true` | 画像条件付けを有効化 |
+| `character_encoder_model` | timm / HF Hub 経由で使う画像エンコーダ |
+| `character_image_size` | 画像入力サイズ |
+| `character_use_all_patches` | 画像エンコーダの全パッチを使うか |
+| `character_projector.type` | 画像特徴を音声モデル側に写すプロジェクタの種類（現状 `mlp`） |
+| `character_projector.hidden_dim` | プロジェクタの中間次元 |
+| `character_projector.num_layers` | **MLP ブロック数**。1ブロック = `Linear -> SiLU -> Linear` |
+| `character_condition_dropout` | 画像条件付けのドロップアウト率 |
+| `character_unconditional_fill` | 画像なしサンプルや条件ドロップ時の埋め方（`zero` / `randn` / `rand`） |
+
+### プレビュー生成で画像を使う
+
+`preview_samples` にも `image_path` を指定できます。
+
+```yaml
+train:
+  preview_every: 1000
+  preview_samples:
+    - text: こんにちは、今日はいい天気ですね。
+      image_path: /path/to/character_reference.png
+      num_steps: 20
+      cfg_scale_text: 3.0
+      cfg_scale_character: 3.0
+```
 
 ---
 
