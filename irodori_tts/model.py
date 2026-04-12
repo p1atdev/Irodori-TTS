@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from typing import NamedTuple
 
 import torch
 import torch.nn as nn
@@ -181,7 +182,17 @@ class SelfAttention(nn.Module):
         ).transpose(1, 2)
         y = y.reshape(bsz, seq_len, self.dim)
         y = y * torch.sigmoid(gate)
+
         return self.wo(y)
+
+
+class ProjectedKV(NamedTuple):
+    k_text: torch.Tensor
+    v_text: torch.Tensor
+    k_speaker: torch.Tensor | None
+    v_speaker: torch.Tensor | None
+    k_caption: torch.Tensor | None
+    v_caption: torch.Tensor | None
 
 
 class JointAttention(nn.Module):
@@ -212,14 +223,17 @@ class JointAttention(nn.Module):
         self.wv = nn.Linear(dim, dim, bias=False)
         self.wk_text = nn.Linear(text_ctx_dim, dim, bias=False)
         self.wv_text = nn.Linear(text_ctx_dim, dim, bias=False)
+
         self.has_speaker_condition = speaker_ctx_dim is not None
         if self.has_speaker_condition:
             self.wk_speaker = nn.Linear(int(speaker_ctx_dim), dim, bias=False)
             self.wv_speaker = nn.Linear(int(speaker_ctx_dim), dim, bias=False)
+
         self.has_caption_condition = caption_ctx_dim is not None
         if self.has_caption_condition:
             self.wk_caption = nn.Linear(int(caption_ctx_dim), dim, bias=False)
             self.wv_caption = nn.Linear(int(caption_ctx_dim), dim, bias=False)
+
         self.gate = nn.Linear(dim, dim, bias=False)
         self.wo = nn.Linear(dim, dim, bias=False)
 
@@ -236,11 +250,13 @@ class JointAttention(nn.Module):
         text_context: torch.Tensor,
         speaker_context: torch.Tensor | None,
         caption_context: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, ...]:
+    ) -> ProjectedKV:
         """
         Precompute conditioning KV projections for static conditioning.
         """
+
         bsz = text_context.shape[0]
+
         k_text = self.wk_text(text_context).reshape(
             bsz, text_context.shape[1], self.heads, self.head_dim
         )
@@ -248,7 +264,9 @@ class JointAttention(nn.Module):
             bsz, text_context.shape[1], self.heads, self.head_dim
         )
         k_text = self.k_norm(k_text)
-        projected: list[torch.Tensor] = [k_text, v_text]
+
+        k_speaker = None
+        v_speaker = None
         if self.has_speaker_condition:
             if speaker_context is None:
                 raise ValueError(
@@ -266,14 +284,23 @@ class JointAttention(nn.Module):
                 bsz, speaker_context.shape[1], self.heads, self.head_dim
             )
             k_speaker = self.k_norm(k_speaker)
-            projected.extend([k_speaker, v_speaker])
+
         elif speaker_context is not None and speaker_context.shape[0] != bsz:
             raise ValueError(
                 "Batch mismatch for ignored speaker context: "
                 f"text={tuple(text_context.shape)} speaker={tuple(speaker_context.shape)}"
             )
+
         if not self.has_caption_condition:
-            return tuple(projected)
+            return ProjectedKV(
+                k_text=k_text,
+                v_text=v_text,
+                k_speaker=k_speaker,
+                v_speaker=v_speaker,
+                k_caption=None,
+                v_caption=None,
+            )
+
         if caption_context is None:
             raise ValueError("caption_context is required when caption conditioning is enabled.")
         if caption_context.shape[0] != bsz:
@@ -281,6 +308,7 @@ class JointAttention(nn.Module):
                 "Batch mismatch for caption context projection: "
                 f"text={tuple(text_context.shape)} caption={tuple(caption_context.shape)}"
             )
+
         k_caption = self.wk_caption(caption_context).reshape(
             bsz, caption_context.shape[1], self.heads, self.head_dim
         )
@@ -288,8 +316,15 @@ class JointAttention(nn.Module):
             bsz, caption_context.shape[1], self.heads, self.head_dim
         )
         k_caption = self.k_norm(k_caption)
-        projected.extend([k_caption, v_caption])
-        return tuple(projected)
+
+        return ProjectedKV(
+            k_text=k_text,
+            v_text=v_text,
+            k_speaker=k_speaker,
+            v_speaker=v_speaker,
+            k_caption=k_caption,
+            v_caption=v_caption,
+        )
 
     def forward(
         self,
@@ -302,12 +337,13 @@ class JointAttention(nn.Module):
         caption_mask: torch.Tensor | None,
         freqs_cis: torch.Tensor,
         self_mask: torch.Tensor | None = None,
-        context_kv: tuple[torch.Tensor, ...] | None = None,
+        context_kv: ProjectedKV | None = None,
     ) -> torch.Tensor:
         bsz, seq_len, _ = x.shape
         q = self.wq(x).reshape(bsz, seq_len, self.heads, self.head_dim)
         k_self = self.wk(x).reshape(bsz, seq_len, self.heads, self.head_dim)
         v_self = self.wv(x).reshape(bsz, seq_len, self.heads, self.head_dim)
+
         if context_kv is None:
             projected = self.project_context_kv(
                 text_context=text_context,
@@ -316,20 +352,11 @@ class JointAttention(nn.Module):
             )
         else:
             projected = context_kv
+
         if projected is None:
             raise RuntimeError("JointAttention projected context unexpectedly missing.")
-        offset = 0
-        k_text, v_text = projected[offset], projected[offset + 1]
-        offset += 2
-        k_speaker = None
-        v_speaker = None
-        if self.has_speaker_condition:
-            k_speaker, v_speaker = projected[offset], projected[offset + 1]
-            offset += 2
-        k_caption = None
-        v_caption = None
-        if self.has_caption_condition:
-            k_caption, v_caption = projected[offset], projected[offset + 1]
+
+        k_text, v_text, k_speaker, v_speaker, k_caption, v_caption = projected
 
         q = self.q_norm(q)
         k_self = self.k_norm(k_self)
@@ -344,9 +371,11 @@ class JointAttention(nn.Module):
                 dtype=torch.bool,
                 device=x.device,
             )
+
         context_k = [k_self, k_text]
         context_v = [v_self, v_text]
         context_masks = [self_mask, text_mask]
+
         if self.has_speaker_condition:
             if speaker_context is None or k_speaker is None or v_speaker is None:
                 raise ValueError(
@@ -358,9 +387,11 @@ class JointAttention(nn.Module):
                     dtype=torch.bool,
                     device=x.device,
                 )
+
             context_k.append(k_speaker)
             context_v.append(v_speaker)
             context_masks.append(speaker_mask)
+
         if self.has_caption_condition:
             if caption_context is None:
                 raise ValueError(
@@ -376,6 +407,7 @@ class JointAttention(nn.Module):
                 raise RuntimeError(
                     "Caption projections are missing despite enabled caption conditioning."
                 )
+
             context_k.append(k_caption)
             context_v.append(v_caption)
             context_masks.append(caption_mask)
@@ -394,6 +426,7 @@ class JointAttention(nn.Module):
         ).transpose(1, 2)
         y = y.reshape(bsz, seq_len, self.dim)
         y = y * torch.sigmoid(self.gate(x))
+
         return self.wo(y)
 
 
@@ -554,7 +587,7 @@ class DiffusionBlock(nn.Module):
         caption_mask: torch.Tensor | None,
         freqs_cis: torch.Tensor,
         self_mask: torch.Tensor | None = None,
-        context_kv: tuple[torch.Tensor, ...] | None = None,
+        context_kv: ProjectedKV | None = None,
     ) -> torch.Tensor:
         h, attention_gate = self.attention_adaln(x, cond_embed)
         x = x + self.dropout(
@@ -598,6 +631,14 @@ class TextToLatentRFDiT(nn.Module):
             norm_eps=cfg.norm_eps,
             dropout=cfg.dropout,
         )
+        self.text_norm = RMSNorm(cfg.text_dim, eps=cfg.norm_eps)
+
+        self.speaker_encoder = None
+        self.speaker_norm = None
+        if cfg.use_speaker_condition:
+            self.speaker_encoder = ReferenceLatentEncoder(cfg)
+            self.speaker_norm = RMSNorm(cfg.speaker_dim, eps=cfg.norm_eps)
+
         self.caption_encoder = None
         self.caption_norm = None
         if cfg.use_caption_condition:
@@ -611,14 +652,8 @@ class TextToLatentRFDiT(nn.Module):
                 dropout=cfg.dropout,
             )
             self.caption_norm = RMSNorm(cfg.caption_dim_resolved, eps=cfg.norm_eps)
-        self.speaker_encoder = None
-        if cfg.use_speaker_condition:
-            self.speaker_encoder = ReferenceLatentEncoder(cfg)
-        self.text_norm = RMSNorm(cfg.text_dim, eps=cfg.norm_eps)
-        self.speaker_norm = None
-        if cfg.use_speaker_condition:
-            self.speaker_norm = RMSNorm(cfg.speaker_dim, eps=cfg.norm_eps)
 
+        # timestep embedder
         self.cond_module = nn.Sequential(
             nn.Linear(cfg.timestep_embed_dim, cfg.model_dim, bias=False),
             nn.SiLU(),
@@ -631,6 +666,7 @@ class TextToLatentRFDiT(nn.Module):
         self.blocks = nn.ModuleList(DiffusionBlock(cfg) for _ in range(cfg.num_layers))
         self.out_norm = RMSNorm(cfg.model_dim, eps=cfg.norm_eps)
         self.out_proj = nn.Linear(cfg.model_dim, cfg.patched_latent_dim)
+
         # Echo/JAX training initializes decoder out projection to zero for stable early training.
         nn.init.zeros_(self.out_proj.weight)
         if self.out_proj.bias is not None:
@@ -670,8 +706,8 @@ class TextToLatentRFDiT(nn.Module):
         self,
         text_input_ids: torch.Tensor,
         text_mask: torch.Tensor,
-        ref_latent: torch.Tensor | None,
-        ref_mask: torch.Tensor | None,
+        speaker_latent: torch.Tensor | None,
+        speaker_mask: torch.Tensor | None,
         caption_input_ids: torch.Tensor | None = None,
         caption_mask: torch.Tensor | None = None,
         text_condition_dropout: torch.Tensor | None = None,
@@ -693,13 +729,13 @@ class TextToLatentRFDiT(nn.Module):
                 raise RuntimeError(
                     "Speaker conditioning is enabled but speaker modules are missing."
                 )
-            if ref_latent is None or ref_mask is None:
+            if speaker_latent is None or speaker_mask is None:
                 raise ValueError(
-                    "ref_latent and ref_mask are required when speaker conditioning is enabled."
+                    "speaker_latent and speaker_mask are required when speaker conditioning is enabled."
                 )
             if speaker_condition_dropout is not None:
-                ref_mask = ref_mask.clone()
-                ref_mask[speaker_condition_dropout] = False
+                speaker_mask = speaker_mask.clone()
+                speaker_mask[speaker_condition_dropout] = False
         if self.cfg.use_caption_condition:
             if self.caption_encoder is None or self.caption_norm is None:
                 raise RuntimeError(
@@ -715,21 +751,24 @@ class TextToLatentRFDiT(nn.Module):
 
         text_state = self.text_encoder(text_input_ids, text_mask)
         text_state = self.text_norm(text_state)
-        ref_state = None
+
+        speaker_state = None
         if self.cfg.use_speaker_condition:
-            ref_latent, ref_mask = patch_sequence_with_mask(
-                seq=ref_latent,
-                mask=ref_mask,
+            speaker_latent, speaker_mask = patch_sequence_with_mask(
+                seq=speaker_latent,
+                mask=speaker_mask,
                 patch_size=self.cfg.speaker_patch_size,
             )
-            ref_state = self.speaker_encoder(ref_latent, ref_mask)
-            ref_state = self.speaker_norm(ref_state)
-            ref_state, ref_mask = self._prepend_masked_mean_token(ref_state, ref_mask)
+            speaker_state = self.speaker_encoder(speaker_latent, speaker_mask)
+            speaker_state = self.speaker_norm(speaker_state)
+            speaker_state, speaker_mask = self._prepend_masked_mean_token(speaker_state, speaker_mask)
+
         caption_state = None
         if self.cfg.use_caption_condition:
             caption_state = self.caption_encoder(caption_input_ids, caption_mask)
             caption_state = self.caption_norm(caption_state)
-        return text_state, text_mask, ref_state, ref_mask, caption_state, caption_mask
+
+        return text_state, text_mask, speaker_state, speaker_mask, caption_state, caption_mask
 
     def forward_with_encoded_conditions(
         self,
@@ -742,9 +781,10 @@ class TextToLatentRFDiT(nn.Module):
         caption_state: torch.Tensor | None = None,
         caption_mask: torch.Tensor | None = None,
         latent_mask: torch.Tensor | None = None,
-        context_kv_cache: list[tuple[torch.Tensor, ...]] | None = None,
+        context_kv_cache: list[ProjectedKV] | None = None,
     ) -> torch.Tensor:
         t_embed = get_timestep_embedding(t, self.cfg.timestep_embed_dim).to(dtype=x_t.dtype)
+
         cond_embed = self.cond_module(t_embed)
         cond_embed = cond_embed[:, None, :]
 
@@ -773,13 +813,18 @@ class TextToLatentRFDiT(nn.Module):
         self,
         x_t: torch.Tensor,
         t: torch.Tensor,
+        # text to speech
         text_input_ids: torch.Tensor,
         text_mask: torch.Tensor,
-        ref_latent: torch.Tensor | None,
-        ref_mask: torch.Tensor | None,
+        # reference speaker voice
+        speaker_latent: torch.Tensor | None,
+        speaker_mask: torch.Tensor | None,
+        # voice designing
         caption_input_ids: torch.Tensor | None = None,
         caption_mask: torch.Tensor | None = None,
+        # self attention mask?
         latent_mask: torch.Tensor | None = None,
+        # CFG
         text_condition_dropout: torch.Tensor | None = None,
         speaker_condition_dropout: torch.Tensor | None = None,
         caption_condition_dropout: torch.Tensor | None = None,
@@ -794,8 +839,8 @@ class TextToLatentRFDiT(nn.Module):
         ) = self.encode_conditions(
             text_input_ids=text_input_ids,
             text_mask=text_mask,
-            ref_latent=ref_latent,
-            ref_mask=ref_mask,
+            speaker_latent=speaker_latent,
+            speaker_mask=speaker_mask,
             caption_input_ids=caption_input_ids,
             caption_mask=caption_mask,
             text_condition_dropout=text_condition_dropout,

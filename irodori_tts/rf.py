@@ -193,13 +193,14 @@ def sample_euler_rf_cfg(
     ) = model.encode_conditions(
         text_input_ids=text_input_ids,
         text_mask=text_mask,
-        ref_latent=ref_latent,
-        ref_mask=ref_mask,
+        speaker_latent=ref_latent,
+        speaker_mask=ref_mask,
         caption_input_ids=caption_input_ids,
         caption_mask=caption_mask,
     )
     text_state_uncond = torch.zeros_like(text_state_cond)
     text_mask_uncond = torch.zeros_like(text_mask_cond)
+    
     speaker_state_uncond = None
     speaker_mask_uncond = None
     if model.cfg.use_speaker_condition:
@@ -209,6 +210,7 @@ def sample_euler_rf_cfg(
             )
         speaker_state_uncond = torch.zeros_like(speaker_state_cond)
         speaker_mask_uncond = torch.zeros_like(speaker_mask_cond)
+    
     caption_state_uncond = None
     caption_mask_uncond = None
     if model.cfg.use_caption_condition:
@@ -296,6 +298,7 @@ def sample_euler_rf_cfg(
                     ),
                 )
             )
+
     cfg_batch_mult = len(independent_bundles)
 
     def _cat_optional_tensors(values: list[torch.Tensor | None]) -> torch.Tensor | None:
@@ -394,6 +397,7 @@ def sample_euler_rf_cfg(
                     speaker_state=bundle[2],
                     caption_state=bundle[4],
                 )
+
     if speaker_kv_scale is not None:
         scale_speaker_kv_cache(
             context_kv_cache=context_kv_cond,
@@ -412,6 +416,7 @@ def sample_euler_rf_cfg(
                 scale=float(speaker_kv_scale),
                 max_layers=speaker_kv_max_layers,
             )
+
     speaker_kv_active = speaker_kv_scale is not None
 
     for i in range(num_steps):
