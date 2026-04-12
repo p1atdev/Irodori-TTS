@@ -6,6 +6,7 @@ from typing import NamedTuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as _torch_checkpoint
 
 from .config import ModelConfig
 from .image_encoder import CharacterImageEncoder
@@ -735,6 +736,7 @@ class TextToLatentRFDiT(nn.Module):
 
         self.in_proj = nn.Linear(cfg.patched_latent_dim, cfg.model_dim)
         self.blocks = nn.ModuleList(DiffusionBlock(cfg) for _ in range(cfg.num_layers))
+        self.gradient_checkpointing = False
         self.out_norm = RMSNorm(cfg.model_dim, eps=cfg.norm_eps)
         self.out_proj = nn.Linear(cfg.model_dim, cfg.patched_latent_dim)
 
@@ -749,6 +751,9 @@ class TextToLatentRFDiT(nn.Module):
         self.register_buffer(
             "_freqs_cis_cache", torch.empty(0, 0, dtype=torch.complex64), persistent=False
         )
+
+    def set_gradient_checkpointing(self, enabled: bool) -> None:
+        self.gradient_checkpointing = bool(enabled)
 
     def _rope_freqs(self, seq_len: int, device: torch.device) -> torch.Tensor:
         cache = self._freqs_cis_cache
@@ -902,22 +907,45 @@ class TextToLatentRFDiT(nn.Module):
 
         x = self.in_proj(x_t)
         freqs = self._rope_freqs(x.shape[1], x.device)
+        use_checkpoint = (
+            self.gradient_checkpointing and self.training and context_kv_cache is None
+        )
         for i, block in enumerate(self.blocks):
-            x = block(
-                x=x,
-                cond_embed=cond_embed,
-                text_state=text_state,
-                text_mask=text_mask,
-                speaker_state=speaker_state,
-                speaker_mask=speaker_mask,
-                caption_state=caption_state,
-                caption_mask=caption_mask,
-                character_state=character_state,
-                character_mask=character_mask,
-                freqs_cis=freqs,
-                self_mask=latent_mask,
-                context_kv=context_kv_cache[i] if context_kv_cache is not None else None,
-            )
+            context_kv = context_kv_cache[i] if context_kv_cache is not None else None
+            if use_checkpoint:
+                x = _torch_checkpoint(
+                    block,
+                    x,
+                    cond_embed,
+                    text_state,
+                    text_mask,
+                    speaker_state,
+                    speaker_mask,
+                    caption_state,
+                    caption_mask,
+                    character_state,
+                    character_mask,
+                    freqs,
+                    latent_mask,
+                    context_kv,
+                    use_reentrant=False,
+                )
+            else:
+                x = block(
+                    x=x,
+                    cond_embed=cond_embed,
+                    text_state=text_state,
+                    text_mask=text_mask,
+                    speaker_state=speaker_state,
+                    speaker_mask=speaker_mask,
+                    caption_state=caption_state,
+                    caption_mask=caption_mask,
+                    character_state=character_state,
+                    character_mask=character_mask,
+                    freqs_cis=freqs,
+                    self_mask=latent_mask,
+                    context_kv=context_kv,
+                )
 
         x = self.out_norm(x)
         x = self.out_proj(x)

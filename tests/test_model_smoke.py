@@ -12,7 +12,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import irodori_tts.image_encoder as image_encoder
-from irodori_tts.config import ModelConfig
+from irodori_tts.config import CharacterProjectorConfig, ModelConfig
 from irodori_tts.model import TextToLatentRFDiT
 from irodori_tts.rf import sample_euler_rf_cfg
 
@@ -34,6 +34,9 @@ class DummyImageBackbone(nn.Module):
             device=images.device,
             dtype=images.dtype,
         )
+
+    def reset_classifier(self, num_classes: int) -> None:
+        del num_classes
 
 
 def make_base_config() -> ModelConfig:
@@ -96,12 +99,43 @@ def make_character_config() -> ModelConfig:
     )
 
 
-def patch_character_backbone(monkeypatch) -> None:
+def patch_character_backbone(monkeypatch, *, feature_dim: int = 12, num_tokens: int = 4) -> None:
     monkeypatch.setattr(
-        image_encoder.timm,
+        image_encoder,
         "create_model",
-        lambda *args, **kwargs: DummyImageBackbone(),
+        lambda *args, **kwargs: DummyImageBackbone(
+            feature_dim=feature_dim,
+            num_tokens=num_tokens,
+        ),
     )
+
+
+def test_character_projector_uses_explicit_initialization(monkeypatch) -> None:
+    patch_character_backbone(monkeypatch, feature_dim=64, num_tokens=4)
+
+    encoder = image_encoder.CharacterImageEncoder(
+        timm_model_id="dummy/character-backbone",
+        output_dim=32,
+        use_all_patches=True,
+        image_size=8,
+        pretrained=False,
+        projector_config=CharacterProjectorConfig(
+            type="mlp",
+            hidden_dim=128,
+            num_layers=2,
+        ),
+    )
+
+    projector_linears = [m for m in encoder.proj.modules() if isinstance(m, nn.Linear)]
+    assert projector_linears
+
+    for linear in projector_linears:
+        weight_std = float(linear.weight.std().item())
+        assert 0.015 <= weight_std <= 0.025
+        if linear.bias is not None:
+            assert torch.count_nonzero(linear.bias).item() == 0
+
+    assert torch.allclose(encoder.norm.weight, torch.ones_like(encoder.norm.weight))
 
 
 def test_base_model_forward_runs_without_error() -> None:

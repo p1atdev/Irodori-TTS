@@ -17,7 +17,6 @@ import torch
 import torch.distributed as dist
 import torchaudio
 import wandb
-from PIL import Image as PILImage
 from safetensors import safe_open
 from safetensors.torch import load_file as load_safetensors_file
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -27,13 +26,14 @@ from transformers import AutoConfig, AutoModel
 from irodori_tts.codec import DACVAECodec, patchify_latent, unpatchify_latent
 from irodori_tts.config import (
     ModelConfig,
+    RegexModule,
     TrainConfig,
     dump_configs,
     load_experiment_yaml,
     merge_dataclass_overrides,
 )
 from irodori_tts.dataset import LatentTextDataset, TTSCollator
-from irodori_tts.image_encoder import build_character_transform
+from irodori_tts.image_encoder import build_character_transform, load_character_image
 from irodori_tts.lora import (
     LORA_METADATA_NAME,
     LORA_TARGET_PRESETS,
@@ -475,6 +475,7 @@ def _check_model_config_compatibility(
     current_model_cfg: ModelConfig,
     *,
     require_caption_match: bool,
+    require_character_match: bool,
 ) -> None:
     if checkpoint_model_cfg is None:
         return
@@ -575,6 +576,41 @@ def _check_model_config_compatibility(
                 ),
             ]
         )
+    if require_character_match:
+        comparisons.extend(
+            [
+                (
+                    "use_character_condition",
+                    checkpoint_cfg.use_character_condition,
+                    current_model_cfg.use_character_condition,
+                ),
+                (
+                    "character_encoder_model",
+                    checkpoint_cfg.character_encoder_model,
+                    current_model_cfg.character_encoder_model,
+                ),
+                (
+                    "character_dim",
+                    checkpoint_cfg.character_dim_resolved,
+                    current_model_cfg.character_dim_resolved,
+                ),
+                (
+                    "character_use_all_patches",
+                    checkpoint_cfg.character_use_all_patches,
+                    current_model_cfg.character_use_all_patches,
+                ),
+                (
+                    "character_image_size",
+                    checkpoint_cfg.character_image_size,
+                    current_model_cfg.character_image_size,
+                ),
+                (
+                    "character_projector",
+                    asdict(checkpoint_cfg.character_projector_resolved),
+                    asdict(current_model_cfg.character_projector_resolved),
+                ),
+            ]
+        )
 
     for key, checkpoint_value, current_value in comparisons:
         if checkpoint_value != current_value:
@@ -601,6 +637,24 @@ def checkpoint_uses_caption_condition(
         or key.startswith("caption_norm.")
         or ".wk_caption." in key
         or ".wv_caption." in key
+        for key in state_dict
+    )
+
+
+def checkpoint_uses_character_condition(
+    checkpoint_model_cfg: dict | None,
+    state_dict: dict[str, torch.Tensor],
+) -> bool:
+    if checkpoint_model_cfg is not None:
+        checkpoint_cfg = merge_dataclass_overrides(
+            ModelConfig(),
+            checkpoint_model_cfg,
+            section="checkpoint model_config",
+        )
+        if checkpoint_cfg.use_character_condition:
+            return True
+    return any(
+        key.startswith("character_encoder.") or ".wk_character." in key or ".wv_character." in key
         for key in state_dict
     )
 
@@ -657,6 +711,13 @@ def is_speaker_only_parameter(key: str) -> bool:
     )
 
 
+def is_character_only_parameter(key: str) -> bool:
+    key = _canonical_parameter_key(key)
+    return (
+        key.startswith("character_encoder.") or ".wk_character." in key or ".wv_character." in key
+    )
+
+
 def clear_non_caption_grads(model: TextToLatentRFDiT) -> tuple[int, int]:
     caption_grad_params = 0
     cleared_grad_params = 0
@@ -671,28 +732,37 @@ def clear_non_caption_grads(model: TextToLatentRFDiT) -> tuple[int, int]:
     return caption_grad_params, cleared_grad_params
 
 
-def validate_caption_upgrade_partial_load(
+def validate_condition_upgrade_partial_load(
     checkpoint_path: Path,
     missing_keys: list[str],
     skipped_shape: list[str],
     skipped_extra: list[str],
+    *,
+    allow_caption_missing: bool,
+    allow_character_missing: bool,
 ) -> None:
     if skipped_shape:
         raise ValueError(
-            "Checkpoint/config shape mismatch while upgrading caption conditioning: "
+            "Checkpoint/config shape mismatch while upgrading conditioning branches: "
             f"{checkpoint_path} skipped_shape={skipped_shape[:8]}"
         )
     non_speaker_extra = [key for key in skipped_extra if not is_speaker_only_parameter(key)]
     if non_speaker_extra:
         raise ValueError(
-            "Unexpected checkpoint keys while upgrading caption conditioning: "
+            "Unexpected checkpoint keys while upgrading conditioning branches: "
             f"{checkpoint_path} skipped_extra={non_speaker_extra[:8]}"
         )
-    non_caption_missing = [key for key in missing_keys if not is_caption_only_parameter(key)]
-    if non_caption_missing:
+
+    def _is_allowed_missing(key: str) -> bool:
+        return (allow_caption_missing and is_caption_only_parameter(key)) or (
+            allow_character_missing and is_character_only_parameter(key)
+        )
+
+    non_optional_missing = [key for key in missing_keys if not _is_allowed_missing(key)]
+    if non_optional_missing:
         raise ValueError(
-            "Partial init from caption-free checkpoint left non-caption parameters missing: "
-            f"{checkpoint_path} missing={non_caption_missing[:8]}"
+            "Partial init left non-upgrade parameters missing: "
+            f"{checkpoint_path} missing={non_optional_missing[:8]}"
         )
 
 
@@ -843,65 +913,82 @@ def _apply_base_initialization(
         init_path = _normalize_checkpoint_path(checkpoint_path)
         init_state, init_model_cfg, _ = _load_model_state_from_checkpoint(init_path)
         checkpoint_has_caption = checkpoint_uses_caption_condition(init_model_cfg, init_state)
+        checkpoint_has_character = checkpoint_uses_character_condition(init_model_cfg, init_state)
         current_has_caption = bool(model_cfg.use_caption_condition)
+        current_has_character = bool(model_cfg.use_character_condition)
         if checkpoint_has_caption and not current_has_caption:
             raise ValueError(
                 "Caption-conditioned checkpoint cannot initialize a caption-free config. "
                 "Use a caption-enabled config for this checkpoint."
             )
+        if checkpoint_has_character and not current_has_character:
+            raise ValueError(
+                "Character-conditioned checkpoint cannot initialize a character-free config. "
+                "Use a character-enabled config for this checkpoint."
+            )
 
         require_caption_match = checkpoint_has_caption and current_has_caption
+        require_character_match = checkpoint_has_character and current_has_character
         _check_model_config_compatibility(
             init_path,
             init_model_cfg,
             model_cfg,
             require_caption_match=require_caption_match,
+            require_character_match=require_character_match,
         )
 
         missing_keys: list[str] = []
         initialized_caption_embedding = False
-        if current_has_caption and not checkpoint_has_caption:
+        resolved_character_branch = False
+        if (current_has_caption and not checkpoint_has_caption) or (
+            current_has_character and not checkpoint_has_character
+        ):
             missing_keys, skipped_shape, skipped_extra = load_model_state_partially(
                 raw_model,
                 init_state,
             )
-            validate_caption_upgrade_partial_load(
+            validate_condition_upgrade_partial_load(
                 init_path,
                 missing_keys,
                 skipped_shape,
                 skipped_extra,
+                allow_caption_missing=current_has_caption and not checkpoint_has_caption,
+                allow_character_missing=current_has_character and not checkpoint_has_character,
             )
-            if distributed:
-                if is_main_process:
-                    print(
-                        "Initializing caption embedding from pretrained model after caption-free checkpoint load: "
-                        f"{model_cfg.caption_tokenizer_repo_resolved}"
-                    )
+            if current_has_caption and not checkpoint_has_caption:
+                if distributed:
+                    if is_main_process:
+                        print(
+                            "Initializing caption embedding from pretrained model after caption-free checkpoint load: "
+                            f"{model_cfg.caption_tokenizer_repo_resolved}"
+                        )
+                        initialize_caption_embedding_from_pretrained(
+                            raw_model,
+                            model_cfg,
+                            local_files_only=False,
+                        )
+                    dist.barrier()
+                    if not is_main_process:
+                        initialize_caption_embedding_from_pretrained(
+                            raw_model,
+                            model_cfg,
+                            local_files_only=True,
+                        )
+                    dist.barrier()
+                else:
+                    if is_main_process:
+                        print(
+                            "Initializing caption embedding from pretrained model after caption-free checkpoint load: "
+                            f"{model_cfg.caption_tokenizer_repo_resolved}"
+                        )
                     initialize_caption_embedding_from_pretrained(
                         raw_model,
                         model_cfg,
                         local_files_only=False,
                     )
-                dist.barrier()
-                if not is_main_process:
-                    initialize_caption_embedding_from_pretrained(
-                        raw_model,
-                        model_cfg,
-                        local_files_only=True,
-                    )
-                dist.barrier()
-            else:
-                if is_main_process:
-                    print(
-                        "Initializing caption embedding from pretrained model after caption-free checkpoint load: "
-                        f"{model_cfg.caption_tokenizer_repo_resolved}"
-                    )
-                initialize_caption_embedding_from_pretrained(
-                    raw_model,
-                    model_cfg,
-                    local_files_only=False,
-                )
-            initialized_caption_embedding = True
+                initialized_caption_embedding = True
+            if current_has_character and not checkpoint_has_character:
+                resolved_character_branch = True
         else:
             raw_model.load_state_dict(init_state, strict=True)
 
@@ -911,6 +998,11 @@ def _apply_base_initialization(
                 print(f"Partial load missing keys: {len(missing_keys)}")
             if initialized_caption_embedding:
                 print("Caption embedding was initialized from its pretrained tokenizer backbone.")
+            if resolved_character_branch:
+                print(
+                    "Character conditioning weights were kept from the current model initialization "
+                    "(pretrained timm backbone + freshly initialized projector/attention weights)."
+                )
         return
 
     raise ValueError(f"Unsupported base_init mode: {mode!r}")
@@ -990,6 +1082,30 @@ def optimizer_set_train_mode(optimizer, train: bool) -> None:
         optimizer.eval()
 
 
+def _compile_trainable_module_specs(
+    specs: list[str | RegexModule],
+) -> list[str | re.Pattern[str]]:
+    compiled: list[str | re.Pattern[str]] = []
+    for spec in specs:
+        if isinstance(spec, str):
+            compiled.append(spec)
+            continue
+        try:
+            compiled.append(re.compile(spec.regex))
+        except re.error as exc:
+            raise ValueError(f"Invalid trainable_modules regex: {spec.regex!r}") from exc
+    return compiled
+
+
+def _matches_trainable_module_spec(
+    parameter_name: str,
+    spec: str | re.Pattern[str],
+) -> bool:
+    if isinstance(spec, str):
+        return parameter_name.startswith(spec)
+    return spec.search(parameter_name) is not None
+
+
 _VALID_UNCONDITIONAL_FILLS = {"zero", "randn", "rand"}
 
 
@@ -1066,7 +1182,7 @@ def load_preview_reference_image(image_path: str | None):
     image_path_str = "" if image_path is None else str(image_path).strip()
     if not image_path_str:
         return None
-    return PILImage.open(Path(image_path_str).expanduser()).convert("RGB")
+    return load_character_image(Path(image_path_str).expanduser())
 
 
 def log_preview_reference_images(
@@ -1101,7 +1217,7 @@ def run_preview(
     model,
     model_cfg: ModelConfig,
     samples: list[PreviewSampleConfig],
-    codec,
+    codec: DACVAECodec,
     device: torch.device,
     use_bf16: bool,
     step: int,
@@ -1144,9 +1260,9 @@ def run_preview(
                 if model_cfg.use_speaker_condition and cfg.ref_wav:
                     wav, sr = torchaudio.load(cfg.ref_wav)
                     wav = wav.to(device)
-                    ref_raw = codec.encode(wav)  # (T, D)
+                    ref_raw = codec.encode_waveform(wav, sample_rate=sr)  # (1, T, D)
                     ref_patched = patchify_latent(
-                        ref_raw.unsqueeze(0), model_cfg.latent_patch_size
+                        ref_raw, model_cfg.latent_patch_size
                     )  # (1, T_p, D_p)
                     ref_latent = ref_patched
                     ref_mask = torch.ones(ref_patched.shape[:2], dtype=torch.bool, device=device)
@@ -1174,7 +1290,7 @@ def run_preview(
                     # Estimate from text length: ~5 chars/sec for Japanese, 1s padding
                     seconds = max(2.0, len(cfg.text) / 5.0 + 1.0)
                 target_samples = int(seconds * codec.sample_rate)
-                latent_steps = target_samples // codec.model.hop_length
+                latent_steps = target_samples // int(codec.model.hop_length)
                 seq_len = max(1, -(-latent_steps // model_cfg.latent_patch_size))  # ceil div
 
                 # 6. Sample
@@ -1215,10 +1331,8 @@ def run_preview(
                     patch_size=model_cfg.latent_patch_size,
                     latent_dim=model_cfg.latent_dim,
                 )
-                audio = codec.decode(z[0])  # (T,) or (1, T)
-                if audio.ndim > 1:
-                    audio = audio[0]
-                audio_np = audio.cpu().float().numpy()
+                audio = codec.decode_latent(z)  # (B, 1, samples)
+                audio_np = audio[0, 0].cpu().float().numpy()
 
                 key = f"preview/audio_{i}"
                 try:
@@ -1318,8 +1432,8 @@ def run_validation(
                     t=t,
                     text_input_ids=text_ids,
                     text_mask=text_mask,
-                    ref_latent=ref_latent,
-                    ref_mask=ref_mask,
+                    speaker_latent=ref_latent,
+                    speaker_mask=ref_mask,
                     caption_input_ids=caption_ids,
                     caption_mask=caption_mask,
                     character_images=character_images_val,
@@ -1385,6 +1499,13 @@ def main() -> None:
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Enable torch.compile for the training model.",
+    )
+    parser.add_argument(
+        "--gradient-checkpointing",
+        dest="gradient_checkpointing",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable activation checkpointing on diffusion blocks to reduce memory.",
     )
     parser.add_argument(
         "--resume",
@@ -1603,7 +1724,8 @@ def main() -> None:
         help=(
             "Comma-separated list of module name prefixes to keep trainable "
             "(all others are frozen). e.g. 'character_encoder.proj,character_encoder.norm'. "
-            "Compatible with LoRA (adapter params are always kept trainable)."
+            "Compatible with LoRA (adapter params are always kept trainable). "
+            "For regex-based matching, use YAML entries like {regex: '...'} under train.trainable_modules."
         ),
     )
     ddp_group = parser.add_mutually_exclusive_group()
@@ -1658,6 +1780,8 @@ def main() -> None:
         train_cfg = replace(train_cfg, allow_tf32=args.allow_tf32)
     if args.compile_model is not None:
         train_cfg = replace(train_cfg, compile_model=args.compile_model)
+    if args.gradient_checkpointing is not None:
+        train_cfg = replace(train_cfg, gradient_checkpointing=args.gradient_checkpointing)
     if cli_provided(raw_argv, "--batch-size"):
         train_cfg = replace(train_cfg, batch_size=args.batch_size)
     if cli_provided(raw_argv, "--gradient-accumulation-steps"):
@@ -1761,6 +1885,7 @@ def main() -> None:
             train_cfg,
             trainable_modules=[s.strip() for s in args.trainable_modules.split(",") if s.strip()],
         )
+    train_cfg = replace(train_cfg, trainable_modules=train_cfg.trainable_modules_resolved)
 
     resume_path = Path(args.resume).expanduser() if args.resume is not None else None
     resume_train_cfg = None
@@ -2211,17 +2336,22 @@ def main() -> None:
         )
 
     if train_cfg.trainable_modules is not None:
+        compiled_trainable_module_specs = _compile_trainable_module_specs(
+            train_cfg.trainable_modules
+        )
         # Freeze all parameters first.
         for p in raw_model.parameters():
             p.requires_grad_(False)
-        # Unfreeze parameters matching any of the specified module name prefixes.
-        # When combined with LoRA, LoRA adapter params are also unfrozen below
-        # if their names match a prefix.
+        # Unfreeze parameters matching any configured prefix or regex.
+        # When combined with LoRA, LoRA adapter params are also unfrozen below.
         unfrozen_count = 0
         total_count = 0
         for name, p in raw_model.named_parameters():
             total_count += 1
-            if any(name.startswith(prefix) for prefix in train_cfg.trainable_modules):
+            if any(
+                _matches_trainable_module_spec(name, spec)
+                for spec in compiled_trainable_module_specs
+            ):
                 p.requires_grad_(True)
                 unfrozen_count += 1
             elif train_config_uses_lora(train_cfg) and "lora_" in name:
@@ -2233,6 +2363,11 @@ def main() -> None:
                 f"trainable_modules={train_cfg.trainable_modules!r}: "
                 f"{unfrozen_count:,}/{total_count:,} parameters trainable."
             )
+
+    if train_cfg.gradient_checkpointing:
+        raw_model.set_gradient_checkpointing(True)
+        if is_main_process:
+            print("Gradient checkpointing enabled on diffusion blocks.")
 
     train_model = raw_model
     if train_cfg.compile_model:
@@ -2451,8 +2586,8 @@ def main() -> None:
                             t=t,
                             text_input_ids=text_ids,
                             text_mask=text_mask,
-                            ref_latent=ref_latent,
-                            ref_mask=ref_mask,
+                            speaker_latent=ref_latent,
+                            speaker_mask=ref_mask,
                             caption_input_ids=caption_ids,
                             caption_mask=caption_mask,
                             character_images=character_images,

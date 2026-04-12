@@ -788,13 +788,14 @@ class InferenceRuntime:
             if self.model_cfg.use_character_condition:
                 if req.character_image is not None and str(req.character_image).strip():
                     from pathlib import Path as _Path
-                    from PIL import Image as _PILImage
+
+                    from .image_encoder import load_character_image
 
                     if self.character_image_transform is None:
                         raise RuntimeError(
                             "Character conditioning is enabled but character image transform is not loaded."
                         )
-                    img = _PILImage.open(_Path(req.character_image)).convert("RGB")
+                    img = load_character_image(_Path(req.character_image))
                     img_tensor = self.character_image_transform(img).unsqueeze(0).to(self.model_device)
                     character_images = img_tensor.expand(num_candidates, -1, -1, -1)
                 else:

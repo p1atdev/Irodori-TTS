@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 import random
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import torch
 from torch.utils.data import Dataset
@@ -194,9 +195,9 @@ class LatentTextDataset(Dataset):
                 if not img_path.is_absolute():
                     img_path = (self.manifest_dir / img_path).resolve()
                 try:
-                    from PIL import Image as PILImage
+                    from .image_encoder import load_character_image
 
-                    img = PILImage.open(img_path).convert("RGB")
+                    img = load_character_image(img_path)
                     image_tensor = self.character_image_transform(img)
                     has_image = True
                 except Exception:

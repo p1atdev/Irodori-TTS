@@ -1,13 +1,38 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from os import PathLike
 
-import timm
-import timm.data
 import torch
 import torch.nn as nn
+from PIL import Image as PILImage
+from timm import create_model
+from timm import data as timm_data
 
 from .config import CharacterProjectorConfig
+
+
+def load_character_image(
+    path: str | PathLike[str],
+    *,
+    background: tuple[int, int, int] = (255, 255, 255),
+) -> PILImage.Image:
+    """Open an image and return it as RGB, compositing transparent pixels onto a solid background."""
+    img = PILImage.open(path)
+    if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+        img = img.convert("RGBA")
+        canvas = PILImage.new("RGB", img.size, background)
+        canvas.paste(img, mask=img.split()[-1])
+        return canvas
+    return img.convert("RGB")
+
+_PROJECTOR_LINEAR_INIT_STD = 0.02
+
+
+def _init_projector_linear(module: nn.Linear) -> None:
+    nn.init.normal_(module.weight, mean=0.0, std=_PROJECTOR_LINEAR_INIT_STD)
+    if module.bias is not None:
+        nn.init.zeros_(module.bias)
 
 
 class _RMSNorm(nn.Module):
@@ -15,8 +40,12 @@ class _RMSNorm(nn.Module):
 
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(dim))
+        self.weight = nn.Parameter(torch.empty(dim))
         self.eps = eps
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        nn.init.ones_(self.weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x_dtype = x.dtype
@@ -33,6 +62,11 @@ class _MLPBlock(nn.Module):
         self.fc1 = nn.Linear(in_dim, hidden_dim, bias=False)
         self.act = nn.SiLU()
         self.fc2 = nn.Linear(hidden_dim, out_dim, bias=False)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        _init_projector_linear(self.fc1)
+        _init_projector_linear(self.fc2)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.fc2(self.act(self.fc1(x)))
@@ -95,10 +129,10 @@ def build_character_transform(timm_model_id: str, image_size: int) -> Callable:
     The returned transform is a torchvision Compose and is safe to pickle for
     DataLoader multiprocessing workers.
     """
-    m = timm.create_model(timm_model_id, pretrained=False)
-    data_cfg = timm.data.resolve_model_data_config(m)
+    m = create_model(timm_model_id, pretrained=False)
+    data_cfg = timm_data.resolve_model_data_config(m)
     data_cfg["input_size"] = (3, image_size, image_size)
-    transform = timm.data.create_transform(**data_cfg, is_training=False)
+    transform = timm_data.create_transform(**data_cfg, is_training=False)
     del m
     return transform
 
@@ -136,12 +170,17 @@ class CharacterImageEncoder(nn.Module):
             projector_config = CharacterProjectorConfig()
 
         # Load backbone without classification head, retaining all spatial tokens.
-        self.backbone = timm.create_model(
+        backbone = create_model(
             timm_model_id,
             pretrained=pretrained,
-            num_classes=0,
             global_pool="",
         )
+        # num_classes=0 にするとヘッドが削除されてから load_state_dict されてエラーになってしまうため、
+        # 読み込んでからヘッドを消す
+        reset_classifier = getattr(backbone, "reset_classifier", None)
+        if callable(reset_classifier):
+            reset_classifier(0)  # remove classifier head later
+        self.backbone = backbone
         self.use_all_patches = use_all_patches
         self._image_size = image_size
 

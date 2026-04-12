@@ -14,6 +14,13 @@ class CharacterProjectorConfig:
     num_layers: int = 1
 
 
+@dataclass(frozen=True)
+class RegexModule:
+    """Regex-based selector for trainable parameter names."""
+
+    regex: str
+
+
 @dataclass
 class ModelConfig:
     latent_dim: int = 128
@@ -144,6 +151,7 @@ class TrainConfig:
     dataloader_prefetch_factor: int = 2
     allow_tf32: bool = False
     compile_model: bool = False
+    gradient_checkpointing: bool = False
     learning_rate: float = 1e-4
     weight_decay: float = 0.01
     optimizer: str = "muon"
@@ -197,10 +205,47 @@ class TrainConfig:
     lora_dropout: float = 0.0
     lora_bias: str = "none"
     lora_target_modules: str = "diffusion_attn"
-    trainable_modules: list | None = None
+    trainable_modules: list[str | RegexModule] | None = None
     seed: int = 0
     preview_every: int = 0
     preview_samples: list | None = None
+
+    @property
+    def trainable_modules_resolved(self) -> list[str | RegexModule] | None:
+        if self.trainable_modules is None:
+            return None
+
+        resolved: list[str | RegexModule] = []
+        for idx, item in enumerate(self.trainable_modules):
+            if isinstance(item, str):
+                item = item.strip()
+                if not item:
+                    raise ValueError(f"trainable_modules[{idx}] must not be an empty string.")
+                resolved.append(item)
+                continue
+
+            if isinstance(item, RegexModule):
+                if not item.regex:
+                    raise ValueError(f"trainable_modules[{idx}].regex must not be empty.")
+                resolved.append(item)
+                continue
+
+            if isinstance(item, dict):
+                unknown = sorted(set(item) - {"regex"})
+                if unknown:
+                    raise ValueError(
+                        "trainable_modules dict entries only support the key 'regex', "
+                        f"got unknown keys at index {idx}: {unknown}"
+                    )
+                resolved.append(RegexModule(**item))
+                continue
+
+            raise ValueError(
+                "trainable_modules entries must be strings or mappings like {'regex': '...'}, "
+                f"got {type(item)!r} at index {idx}."
+            )
+
+        return resolved
 
 
 @dataclass
