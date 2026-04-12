@@ -4,7 +4,7 @@ import json
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import torch
 from torch.utils.data import Dataset
@@ -51,6 +51,10 @@ class LatentTextDataset(Dataset):
         manifest_index: _ManifestIndex | None = None,
         show_manifest_progress: bool = False,
         manifest_progress_desc: str | None = None,
+        enable_character_condition: bool = False,
+        character_image_transform: Callable | None = None,
+        character_image_key: str = "image_path",
+        character_image_size: int = 448,
     ):
         self.manifest_path = Path(manifest_path)
         self.manifest_dir = self.manifest_path.parent
@@ -59,6 +63,10 @@ class LatentTextDataset(Dataset):
         self.enable_caption_condition = bool(enable_caption_condition)
         self.enable_speaker_condition = bool(enable_speaker_condition)
         self.caption_key = str(caption_key)
+        self.enable_character_condition = bool(enable_character_condition)
+        self.character_image_transform = character_image_transform
+        self.character_image_key = str(character_image_key)
+        self.character_image_size = int(character_image_size)
         self._manifest_fp = None
         subset_index_set: set[int] | None = None
         if subset_indices is not None:
@@ -70,6 +78,7 @@ class LatentTextDataset(Dataset):
             manifest_index = _ManifestIndex.build(
                 manifest_path=self.manifest_path,
                 caption_key=self.caption_key,
+                image_key=self.character_image_key,
                 show_progress=show_manifest_progress,
                 progress_desc=manifest_progress_desc,
             )
@@ -94,6 +103,7 @@ class LatentTextDataset(Dataset):
         self.speaker_to_indices: dict[str, list[int]] = {}
         self.speaker_labeled_count = 0
         self.caption_labeled_count = 0
+        self.image_labeled_count = 0
         for local_index, sample_index in enumerate(self.sample_indices):
             speaker_id = self.manifest_index.speaker_ids[sample_index]
             if speaker_id is not None:
@@ -102,6 +112,8 @@ class LatentTextDataset(Dataset):
                     self.speaker_to_indices.setdefault(speaker_id, []).append(local_index)
             if self.manifest_index.has_caption[sample_index]:
                 self.caption_labeled_count += 1
+            if self.manifest_index.has_image[sample_index]:
+                self.image_labeled_count += 1
 
         if not self.sample_indices:
             raise ValueError(f"No valid samples in manifest: {self.manifest_path}")
@@ -162,7 +174,7 @@ class LatentTextDataset(Dataset):
         else:
             ref_item = self._read_item(ref_index)
             ref_latent = self._load_latent(ref_item["latent_path"])
-        return {
+        out: dict[str, Any] = {
             "text": item["text"],
             "caption": str(item.get(self.caption_key, "")) if self.enable_caption_condition else "",
             "has_caption": bool(str(item.get(self.caption_key, "")).strip())
@@ -173,13 +185,42 @@ class LatentTextDataset(Dataset):
             "has_speaker": has_speaker,
         }
 
+        if self.enable_character_condition:
+            image_path_raw = str(item.get(self.character_image_key, "")).strip()
+            image_tensor: torch.Tensor
+            has_image = False
+            if image_path_raw and self.character_image_transform is not None:
+                img_path = Path(image_path_raw).expanduser()
+                if not img_path.is_absolute():
+                    img_path = (self.manifest_dir / img_path).resolve()
+                try:
+                    from PIL import Image as PILImage
+
+                    img = PILImage.open(img_path).convert("RGB")
+                    image_tensor = self.character_image_transform(img)
+                    has_image = True
+                except Exception:
+                    image_tensor = torch.zeros(
+                        3, self.character_image_size, self.character_image_size, dtype=torch.float32
+                    )
+            else:
+                image_tensor = torch.zeros(
+                    3, self.character_image_size, self.character_image_size, dtype=torch.float32
+                )
+            out["image"] = image_tensor
+            out["has_image"] = has_image
+
+        return out
+
 
 @dataclass(frozen=True)
 class _ManifestIndex:
     offsets: list[int]
     speaker_ids: list[str | None]
     has_caption: list[bool]
+    has_image: list[bool]
     caption_key: str
+    image_key: str
 
     @classmethod
     def build(
@@ -187,12 +228,14 @@ class _ManifestIndex:
         manifest_path: Path,
         *,
         caption_key: str = "caption",
+        image_key: str = "image_path",
         show_progress: bool = False,
         progress_desc: str | None = None,
     ) -> _ManifestIndex:
         offsets: list[int] = []
         speaker_ids: list[str | None] = []
         has_caption: list[bool] = []
+        has_image: list[bool] = []
         total_bytes = manifest_path.stat().st_size
         if progress_desc is None:
             progress_desc = f"Index Manifest ({manifest_path.name})"
@@ -224,6 +267,7 @@ class _ManifestIndex:
                     speaker_id = item.get("speaker_id")
                     speaker_ids.append(None if speaker_id is None else str(speaker_id))
                     has_caption.append(bool(str(item.get(caption_key, "")).strip()))
+                    has_image.append(bool(str(item.get(image_key, "")).strip()))
             finally:
                 pbar.close()
         if not offsets:
@@ -232,7 +276,9 @@ class _ManifestIndex:
             offsets=offsets,
             speaker_ids=speaker_ids,
             has_caption=has_caption,
+            has_image=has_image,
             caption_key=str(caption_key),
+            image_key=str(image_key),
         )
 
 
@@ -334,4 +380,7 @@ class TTSCollator:
             out["caption_ids"] = caption_ids
             out["caption_mask"] = caption_mask
             out["has_caption"] = has_caption
+        if "image" in batch[0]:
+            out["character_images"] = torch.stack([x["image"] for x in batch])  # (B, 3, H, W)
+            out["has_image"] = torch.tensor([bool(x["has_image"]) for x in batch], dtype=torch.bool)
         return out

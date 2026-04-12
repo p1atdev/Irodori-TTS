@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import warnings
 
 import torch
 
@@ -232,6 +233,27 @@ def build_optimizer(model: torch.nn.Module, cfg: TrainConfig):
             )
         return MuonWithAuxAdamW(muon_opt=muon_opt, aux_opt=aux_opt)
 
+    if opt_name == "radam_schedule_free":
+        try:
+            from schedulefree import RAdamScheduleFree
+        except ImportError as exc:
+            raise RuntimeError(
+                "optimizer=radam_schedule_free requires the 'schedulefree' library. "
+                "Install with: uv add schedulefree"
+            ) from exc
+        decay, no_decay = _partition_adamw_params(model)
+        param_groups: list[dict] = []
+        if decay:
+            param_groups.append({"params": decay, "weight_decay": cfg.weight_decay})
+        if no_decay:
+            param_groups.append({"params": no_decay, "weight_decay": 0.0})
+        return RAdamScheduleFree(
+            param_groups if param_groups else list(model.parameters()),
+            lr=cfg.learning_rate,
+            betas=(cfg.adam_beta1, cfg.adam_beta2),
+            eps=cfg.adam_eps,
+        )
+
     raise ValueError(f"Unsupported optimizer: {cfg.optimizer}")
 
 
@@ -240,6 +262,13 @@ def build_scheduler(
     cfg: TrainConfig,
 ):
     sched_name = cfg.lr_scheduler.lower()
+    if cfg.optimizer.lower() == "radam_schedule_free" and sched_name != "none":
+        warnings.warn(
+            f"optimizer=radam_schedule_free is schedule-free; "
+            f"lr_scheduler={sched_name!r} will be ignored.",
+            stacklevel=2,
+        )
+        return None
     if sched_name == "none":
         return None
     if sched_name not in {"cosine", "wsd"}:

@@ -178,9 +178,11 @@ class SamplingRequest:
     max_ref_seconds: float | None = 30.0
     max_text_len: int | None = None
     max_caption_len: int | None = None
+    character_image: str | None = None
     num_steps: int = 40
     cfg_scale_text: float = 3.0
     cfg_scale_caption: float = 3.0
+    cfg_scale_character: float = 3.0
     cfg_scale_speaker: float = 5.0
     cfg_guidance_mode: str = "independent"
     cfg_scale: float | None = None
@@ -248,38 +250,46 @@ def resolve_cfg_scales(
     cfg_scale_text: float,
     cfg_scale_caption: float,
     cfg_scale_speaker: float,
+    cfg_scale_character: float = 3.0,
     cfg_scale: float | None,
     use_caption_condition: bool = True,
     use_speaker_condition: bool = True,
-) -> tuple[float, float, float, list[str]]:
+    use_character_condition: bool = False,
+) -> tuple[float, float, float, float, list[str]]:
     """Normalize/validate CFG scales for guidance mode."""
     messages: list[str] = []
     text_val = float(cfg_scale_text)
     caption_val = float(cfg_scale_caption)
     speaker_val = float(cfg_scale_speaker)
+    character_val = float(cfg_scale_character)
 
     if cfg_scale is not None:
         text_val = float(cfg_scale)
         caption_val = float(cfg_scale)
         speaker_val = float(cfg_scale)
+        character_val = float(cfg_scale)
     if not use_speaker_condition:
         if speaker_val > 0.0:
             messages.append(
                 "info: speaker conditioning is disabled for this checkpoint; ignoring cfg_scale_speaker."
             )
         speaker_val = 0.0
+    if not use_character_condition:
+        character_val = 0.0
 
     mode = str(cfg_guidance_mode).strip().lower()
     enabled_vals = [value for value in (text_val, speaker_val) if value > 0.0]
     if use_caption_condition and caption_val > 0.0:
         enabled_vals.append(caption_val)
+    if use_character_condition and character_val > 0.0:
+        enabled_vals.append(character_val)
     if mode == "joint" and enabled_vals and (max(enabled_vals) - min(enabled_vals) > 1e-6):
         raise ValueError(
-            "cfg_guidance_mode='joint' requires equal enabled cfg_scale_text/cfg_scale_caption/cfg_scale_speaker, "
+            "cfg_guidance_mode='joint' requires equal enabled cfg_scale_text/cfg_scale_caption/cfg_scale_speaker/cfg_scale_character, "
             "or set cfg_scale."
         )
 
-    return text_val, caption_val, speaker_val, messages
+    return text_val, caption_val, speaker_val, character_val, messages
 
 
 def _load_torch_checkpoint_payload(path: Path) -> dict:
@@ -403,6 +413,7 @@ class InferenceRuntime:
         codec: DACVAECodec,
         default_text_max_len: int,
         default_caption_max_len: int,
+        character_image_transform: Callable | None = None,
     ) -> None:
         self.key = key
         self.model_device = resolve_runtime_device(key.model_device)
@@ -415,6 +426,7 @@ class InferenceRuntime:
         self.codec = codec
         self.default_text_max_len = default_text_max_len
         self.default_caption_max_len = default_caption_max_len
+        self.character_image_transform = character_image_transform
         self._infer_lock = threading.Lock()
 
     @classmethod
@@ -494,6 +506,15 @@ class InferenceRuntime:
                 "Use a compatible codec/checkpoint pair."
             )
 
+        character_image_transform = None
+        if model_cfg.use_character_condition and model_cfg.character_encoder_model is not None:
+            from .image_encoder import build_character_transform
+
+            character_image_transform = build_character_transform(
+                model_cfg.character_encoder_model,
+                model_cfg.character_image_size,
+            )
+
         return cls(
             key=key,
             model_cfg=model_cfg,
@@ -504,6 +525,7 @@ class InferenceRuntime:
             codec=codec,
             default_text_max_len=default_text_max_len,
             default_caption_max_len=default_caption_max_len,
+            character_image_transform=character_image_transform,
         )
 
     def _load_reference_latent(
@@ -708,14 +730,16 @@ class InferenceRuntime:
                 "Expected one of: independent, joint, alternating."
             )
 
-        cfg_scale_text, cfg_scale_caption, cfg_scale_speaker, scale_messages = resolve_cfg_scales(
+        cfg_scale_text, cfg_scale_caption, cfg_scale_speaker, cfg_scale_character, scale_messages = resolve_cfg_scales(
             cfg_guidance_mode=cfg_mode,
             cfg_scale_text=req.cfg_scale_text,
             cfg_scale_caption=req.cfg_scale_caption,
             cfg_scale_speaker=req.cfg_scale_speaker,
+            cfg_scale_character=req.cfg_scale_character,
             cfg_scale=req.cfg_scale,
             use_caption_condition=has_caption_text,
             use_speaker_condition=self.model_cfg.use_speaker_condition,
+            use_character_condition=self.model_cfg.use_character_condition,
         )
         messages.extend(scale_messages)
         for msg in scale_messages:
@@ -760,6 +784,29 @@ class InferenceRuntime:
                 caption_ids = caption_ids.to(self.model_device)
                 caption_mask = caption_mask.to(self.model_device)
 
+            character_images = None
+            if self.model_cfg.use_character_condition:
+                if req.character_image is not None and str(req.character_image).strip():
+                    from pathlib import Path as _Path
+                    from PIL import Image as _PILImage
+
+                    if self.character_image_transform is None:
+                        raise RuntimeError(
+                            "Character conditioning is enabled but character image transform is not loaded."
+                        )
+                    img = _PILImage.open(_Path(req.character_image)).convert("RGB")
+                    img_tensor = self.character_image_transform(img).unsqueeze(0).to(self.model_device)
+                    character_images = img_tensor.expand(num_candidates, -1, -1, -1)
+                else:
+                    # Unconditional: provide zeros tensor so model gets valid input shape.
+                    character_images = torch.zeros(
+                        num_candidates,
+                        3,
+                        self.model_cfg.character_image_size,
+                        self.model_cfg.character_image_size,
+                        device=self.model_device,
+                    )
+
             target_samples = int(float(req.seconds) * self.codec.sample_rate)
             latent_steps = math.ceil(target_samples / int(self.codec.model.hop_length))
             patched_steps = math.ceil(latent_steps / self.model_cfg.latent_patch_size)
@@ -797,10 +844,12 @@ class InferenceRuntime:
                 sequence_length=patched_steps,
                 caption_input_ids=caption_ids,
                 caption_mask=caption_mask,
+                character_images=character_images,
                 num_steps=int(req.num_steps),
                 cfg_scale_text=cfg_scale_text,
                 cfg_scale_caption=cfg_scale_caption,
                 cfg_scale_speaker=cfg_scale_speaker,
+                cfg_scale_character=cfg_scale_character,
                 cfg_guidance_mode=cfg_mode,
                 cfg_min_t=float(req.cfg_min_t),
                 cfg_max_t=float(req.cfg_max_t),

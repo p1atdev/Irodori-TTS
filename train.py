@@ -8,15 +8,23 @@ import random
 import re
 import shutil
 import sys
+from collections.abc import Callable
 from contextlib import nullcontext
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 import torch
 import torch.distributed as dist
+import torchaudio
+import wandb
+from PIL import Image as PILImage
+from safetensors import safe_open
+from safetensors.torch import load_file as load_safetensors_file
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
+from transformers import AutoConfig, AutoModel
 
+from irodori_tts.codec import DACVAECodec, patchify_latent, unpatchify_latent
 from irodori_tts.config import (
     ModelConfig,
     TrainConfig,
@@ -25,6 +33,7 @@ from irodori_tts.config import (
     merge_dataclass_overrides,
 )
 from irodori_tts.dataset import LatentTextDataset, TTSCollator
+from irodori_tts.image_encoder import build_character_transform
 from irodori_tts.lora import (
     LORA_METADATA_NAME,
     LORA_TARGET_PRESETS,
@@ -42,6 +51,7 @@ from irodori_tts.progress import TrainProgress
 from irodori_tts.rf import (
     rf_interpolate,
     rf_velocity_target,
+    sample_euler_rf_cfg,
     sample_logit_normal_t,
     sample_stratified_logit_normal_t,
 )
@@ -317,14 +327,6 @@ def validate_pretrained_backbone_dim(
     expected_dim: int,
     local_files_only: bool = False,
 ) -> int:
-    try:
-        from transformers import AutoConfig
-    except ImportError as exc:
-        raise RuntimeError(
-            "transformers is required for pretrained text embedding initialization. "
-            "Install with `pip install transformers sentencepiece`."
-        ) from exc
-
     text_cfg = AutoConfig.from_pretrained(
         repo_id,
         trust_remote_code=False,
@@ -372,14 +374,6 @@ def initialize_embedding_from_pretrained(
     repo_id: str,
     local_files_only: bool = False,
 ) -> None:
-    try:
-        from transformers import AutoModel
-    except ImportError as exc:
-        raise RuntimeError(
-            "transformers is required for pretrained text embedding initialization. "
-            "Install with `pip install transformers sentencepiece`."
-        ) from exc
-
     text_backbone = AutoModel.from_pretrained(
         repo_id,
         trust_remote_code=False,
@@ -442,9 +436,6 @@ def _load_model_state_from_checkpoint(
     path: Path,
 ) -> tuple[dict[str, torch.Tensor], dict | None, dict | None]:
     if path.suffix.lower() == ".safetensors":
-        from safetensors import safe_open
-        from safetensors.torch import load_file as load_safetensors_file
-
         checkpoint_model_cfg = None
         with safe_open(str(path), framework="pt", device="cpu") as handle:
             metadata = dict(handle.metadata() or {})
@@ -991,6 +982,209 @@ def split_train_valid_indices(
     return train_indices, valid_indices
 
 
+def optimizer_set_train_mode(optimizer, train: bool) -> None:
+    """Call .train()/.eval() on schedulefree optimizers (no-op for standard optimizers)."""
+    if train and hasattr(optimizer, "train") and callable(optimizer.train):
+        optimizer.train()
+    elif not train and hasattr(optimizer, "eval") and callable(optimizer.eval):
+        optimizer.eval()
+
+
+_VALID_UNCONDITIONAL_FILLS = {"zero", "randn", "rand"}
+
+
+def apply_unconditional_fill(
+    images: torch.Tensor,
+    keep_mask: torch.Tensor,
+    fill: str,
+) -> torch.Tensor:
+    """Replace dropped/missing character images according to the fill strategy.
+
+    Args:
+        images: Character image tensor of shape ``(B, C, H, W)``.
+        keep_mask: Boolean tensor of shape ``(B,)`` — True for samples to keep.
+        fill: One of ``"zero"``, ``"randn"``, ``"rand"``.
+    """
+    mask_4d = keep_mask[:, None, None, None].to(images.dtype)
+    if fill == "zero":
+        return images * mask_4d
+    elif fill == "randn":
+        noise = torch.randn_like(images)
+        return torch.where(keep_mask[:, None, None, None], images, noise)
+    elif fill == "rand":
+        noise = torch.rand_like(images)
+        return torch.where(keep_mask[:, None, None, None], images, noise)
+    else:
+        raise ValueError(
+            f"character_unconditional_fill must be one of {sorted(_VALID_UNCONDITIONAL_FILLS)}, got {fill!r}"
+        )
+
+
+@dataclass
+class PreviewSampleConfig:
+    """Configuration for a single preview audio sample generated during training."""
+
+    text: str
+    caption: str | None = None
+    image_path: str | None = None
+    ref_wav: str | None = None
+    seconds: float | None = None  # None → estimated from text length
+    num_steps: int = 20
+    cfg_scale_text: float = 3.0
+    cfg_scale_caption: float = 3.0
+    cfg_scale_speaker: float = 5.0
+    cfg_scale_character: float = 3.0
+    cfg_guidance_mode: str = "independent"
+    cfg_scale: float | None = None
+    truncation_factor: float | None = None
+    rescale_k: float | None = None
+    rescale_sigma: float | None = None
+    speaker_kv_scale: float | None = None
+    speaker_kv_max_layers: int | None = None
+    speaker_kv_min_t: float | None = None
+    seed: int = 0
+
+
+def run_preview(
+    *,
+    model,
+    model_cfg: ModelConfig,
+    samples: list[PreviewSampleConfig],
+    codec,
+    device: torch.device,
+    use_bf16: bool,
+    step: int,
+    tokenizer,
+    caption_tokenizer,
+    character_image_transform: Callable | None,
+    wandb_run,
+) -> None:
+    """Generate preview audio samples and log them to wandb."""
+    was_training = model.training
+    model.eval()
+    audio_logs: dict = {}
+
+    with torch.no_grad():
+        for i, cfg in enumerate(samples):
+            try:
+                # 1. Tokenize text
+                text_ids, text_mask = tokenizer.batch_encode(
+                    [cfg.text], max_length=model_cfg.text_dim
+                )
+                text_ids = text_ids.to(device)
+                text_mask = text_mask.to(device)
+
+                # 2. Caption
+                caption_ids = None
+                caption_mask = None
+                if model_cfg.use_caption_condition and caption_tokenizer is not None:
+                    caption_text = cfg.caption if cfg.caption else ""
+                    caption_ids, caption_mask = caption_tokenizer.batch_encode(
+                        [caption_text], max_length=512
+                    )
+                    if not caption_text.strip():
+                        caption_mask = caption_mask * 0
+                    caption_ids = caption_ids.to(device)
+                    caption_mask = caption_mask.to(device)
+
+                # 3. Reference speaker audio
+                ref_latent = None
+                ref_mask = None
+                if model_cfg.use_speaker_condition and cfg.ref_wav:
+                    wav, sr = torchaudio.load(cfg.ref_wav)
+                    wav = wav.to(device)
+                    ref_raw = codec.encode(wav)  # (T, D)
+                    ref_patched = patchify_latent(
+                        ref_raw.unsqueeze(0), model_cfg.latent_patch_size
+                    )  # (1, T_p, D_p)
+                    ref_latent = ref_patched
+                    ref_mask = torch.ones(ref_patched.shape[:2], dtype=torch.bool, device=device)
+
+                # 4. Character reference image
+                character_images = None
+                if model_cfg.use_character_condition:
+                    if cfg.image_path and character_image_transform is not None:
+                        img = PILImage.open(cfg.image_path).convert("RGB")
+                        img_tensor = character_image_transform(img).unsqueeze(0).to(device)
+                        character_images = img_tensor
+                    else:
+                        character_images = torch.zeros(
+                            1,
+                            3,
+                            model_cfg.character_image_size,
+                            model_cfg.character_image_size,
+                            device=device,
+                        )
+
+                # 5. Sequence length
+                seconds = cfg.seconds
+                if seconds is None:
+                    # Estimate from text length: ~5 chars/sec for Japanese, 1s padding
+                    seconds = max(2.0, len(cfg.text) / 5.0 + 1.0)
+                target_samples = int(seconds * codec.sample_rate)
+                latent_steps = target_samples // codec.model.hop_length
+                seq_len = max(1, -(-latent_steps // model_cfg.latent_patch_size))  # ceil div
+
+                # 6. Sample
+                with (
+                    torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+                    if use_bf16
+                    else nullcontext()
+                ):
+                    z_patched = sample_euler_rf_cfg(
+                        model=model,
+                        text_input_ids=text_ids,
+                        text_mask=text_mask,
+                        ref_latent=ref_latent,
+                        ref_mask=ref_mask,
+                        sequence_length=seq_len,
+                        caption_input_ids=caption_ids,
+                        caption_mask=caption_mask,
+                        character_images=character_images,
+                        num_steps=cfg.num_steps,
+                        cfg_scale_text=cfg.cfg_scale_text,
+                        cfg_scale_caption=cfg.cfg_scale_caption,
+                        cfg_scale_speaker=cfg.cfg_scale_speaker,
+                        cfg_scale_character=cfg.cfg_scale_character,
+                        cfg_guidance_mode=cfg.cfg_guidance_mode,
+                        cfg_scale=cfg.cfg_scale,
+                        truncation_factor=cfg.truncation_factor,
+                        rescale_k=cfg.rescale_k,
+                        rescale_sigma=cfg.rescale_sigma,
+                        speaker_kv_scale=cfg.speaker_kv_scale,
+                        speaker_kv_max_layers=cfg.speaker_kv_max_layers,
+                        speaker_kv_min_t=cfg.speaker_kv_min_t,
+                        seed=cfg.seed,
+                    )
+
+                # 7. Decode
+                z = unpatchify_latent(
+                    z_patched,
+                    patch_size=model_cfg.latent_patch_size,
+                    latent_dim=model_cfg.latent_dim,
+                )
+                audio = codec.decode(z[0])  # (T,) or (1, T)
+                if audio.ndim > 1:
+                    audio = audio[0]
+                audio_np = audio.cpu().float().numpy()
+
+                key = f"preview/{i}"
+                try:
+                    audio_logs[key] = wandb.Audio(
+                        audio_np, sample_rate=codec.sample_rate, caption=cfg.text[:120]
+                    )
+                except Exception:
+                    pass
+            except Exception as exc:
+                print(f"preview sample {i} failed: {exc}")
+
+    if wandb_run is not None and audio_logs:
+        wandb_run.log(audio_logs, step=step)
+
+    if was_training:
+        model.train()
+
+
 def run_validation(
     *,
     model,
@@ -1014,6 +1208,14 @@ def run_validation(
             if model_cfg.use_caption_condition:
                 caption_ids = batch["caption_ids"].to(device, non_blocking=True)
                 caption_mask = batch["caption_mask"].to(device, non_blocking=True)
+            character_images_val = None
+            if model_cfg.use_character_condition:
+                character_images_val = batch["character_images"].to(device, non_blocking=True)
+                has_image_val = batch["has_image"].to(device, non_blocking=True)
+                # Fill images for samples without a reference image.
+                character_images_val = apply_unconditional_fill(
+                    character_images_val, has_image_val, train_cfg.character_unconditional_fill
+                )
             x0 = batch["latent_patched"].to(device, non_blocking=True)
             x_mask = batch["latent_mask_patched"].to(device, non_blocking=True)
             x_mask_valid = batch["latent_mask_valid_patched"].to(device, non_blocking=True)
@@ -1068,6 +1270,7 @@ def run_validation(
                     ref_mask=ref_mask,
                     caption_input_ids=caption_ids,
                     caption_mask=caption_mask,
+                    character_images=character_images_val,
                     latent_mask=x_mask,
                 )
 
@@ -1342,6 +1545,15 @@ def main() -> None:
         ),
     )
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--trainable-modules",
+        default=None,
+        help=(
+            "Comma-separated list of module name prefixes to keep trainable "
+            "(all others are frozen). e.g. 'character_encoder.proj,character_encoder.norm'. "
+            "Compatible with LoRA (adapter params are always kept trainable)."
+        ),
+    )
     ddp_group = parser.add_mutually_exclusive_group()
     ddp_group.add_argument(
         "--ddp-find-unused-parameters",
@@ -1492,6 +1704,11 @@ def main() -> None:
         )
     if cli_provided(raw_argv, "--seed"):
         train_cfg = replace(train_cfg, seed=args.seed)
+    if args.trainable_modules is not None:
+        train_cfg = replace(
+            train_cfg,
+            trainable_modules=[s.strip() for s in args.trainable_modules.split(",") if s.strip()],
+        )
 
     resume_path = Path(args.resume).expanduser() if args.resume is not None else None
     resume_train_cfg = None
@@ -1541,6 +1758,11 @@ def main() -> None:
         raise ValueError(
             "caption_condition_dropout must be in [0, 1], "
             f"got {train_cfg.caption_condition_dropout}"
+        )
+    if train_cfg.character_unconditional_fill not in _VALID_UNCONDITIONAL_FILLS:
+        raise ValueError(
+            f"character_unconditional_fill must be one of {sorted(_VALID_UNCONDITIONAL_FILLS)}, "
+            f"got {train_cfg.character_unconditional_fill!r}"
         )
     if train_cfg.fixed_target_latent_steps is not None and train_cfg.fixed_target_latent_steps <= 0:
         raise ValueError(
@@ -1605,13 +1827,6 @@ def main() -> None:
         print(f"DDP enabled: world_size={world_size} (local_rank={local_rank})")
     wandb_run = None
     if train_cfg.wandb_enabled and is_main_process:
-        try:
-            import wandb
-        except ImportError as exc:
-            raise RuntimeError(
-                "W&B logging is enabled, but `wandb` is not installed. "
-                "Install it with `pip install wandb`."
-            ) from exc
         wandb_run = wandb.init(
             project=train_cfg.wandb_project,
             entity=train_cfg.wandb_entity,
@@ -1681,12 +1896,25 @@ def main() -> None:
                 f"Caption tokenizer={model_cfg.caption_tokenizer_repo_resolved} vocab={caption_tokenizer.vocab_size} add_bos={model_cfg.caption_add_bos_resolved} padding_side=right "
                 f"(pretrained hidden_size={caption_hidden_size})."
             )
+    character_image_transform = None
+    if model_cfg.use_character_condition:
+        character_image_transform = build_character_transform(
+            model_cfg.character_encoder_model,
+            model_cfg.character_image_size,
+        )
+        if is_main_process:
+            print(
+                f"Character image encoder={model_cfg.character_encoder_model} image_size={model_cfg.character_image_size} dim={model_cfg.character_dim_resolved}."
+            )
     full_dataset = LatentTextDataset(
         manifest_path=train_cfg.manifest_path,
         latent_dim=model_cfg.latent_dim,
         max_latent_steps=train_cfg.max_latent_steps,
         enable_caption_condition=model_cfg.use_caption_condition,
         enable_speaker_condition=model_cfg.use_speaker_condition,
+        enable_character_condition=model_cfg.use_character_condition,
+        character_image_transform=character_image_transform,
+        character_image_size=model_cfg.character_image_size,
         show_manifest_progress=bool(train_cfg.progress and is_main_process),
         manifest_progress_desc="Index Manifest",
     )
@@ -1705,6 +1933,9 @@ def main() -> None:
             subset_indices=train_indices,
             enable_caption_condition=model_cfg.use_caption_condition,
             enable_speaker_condition=model_cfg.use_speaker_condition,
+            enable_character_condition=model_cfg.use_character_condition,
+            character_image_transform=character_image_transform,
+            character_image_size=model_cfg.character_image_size,
             manifest_index=full_dataset.manifest_index,
         )
         valid_dataset = LatentTextDataset(
@@ -1714,6 +1945,9 @@ def main() -> None:
             subset_indices=valid_indices,
             enable_caption_condition=model_cfg.use_caption_condition,
             enable_speaker_condition=model_cfg.use_speaker_condition,
+            enable_character_condition=model_cfg.use_character_condition,
+            character_image_transform=character_image_transform,
+            character_image_size=model_cfg.character_image_size,
             manifest_index=full_dataset.manifest_index,
         )
         if is_main_process:
@@ -1816,6 +2050,11 @@ def main() -> None:
                 "Validation dataloader yielded zero batches. Decrease batch_size or valid_ratio."
             )
 
+    # Codec for preview generation (only on main process, since previewing is for logging).
+    preview_codec = None
+    if train_cfg.preview_every > 0 and train_cfg.preview_samples and is_main_process:
+        preview_codec = DACVAECodec.load(device=str(device))
+
     has_validation = valid_loader is not None and train_cfg.valid_every > 0
     checkpoint_retention_enabled = train_cfg.checkpoint_best_n > 0
     periodic_checkpoint_keep = 0
@@ -1915,6 +2154,31 @@ def main() -> None:
             f"target_modules={train_cfg.lora_target_modules!r} "
             f"trainable={trainable_params:,}/{total_params:,}"
         )
+
+    if train_cfg.trainable_modules is not None:
+        # Freeze all parameters first.
+        for p in raw_model.parameters():
+            p.requires_grad_(False)
+        # Unfreeze parameters matching any of the specified module name prefixes.
+        # When combined with LoRA, LoRA adapter params are also unfrozen below
+        # if their names match a prefix.
+        unfrozen_count = 0
+        total_count = 0
+        for name, p in raw_model.named_parameters():
+            total_count += 1
+            if any(name.startswith(prefix) for prefix in train_cfg.trainable_modules):
+                p.requires_grad_(True)
+                unfrozen_count += 1
+            elif train_config_uses_lora(train_cfg) and "lora_" in name:
+                # Always keep LoRA adapter parameters trainable.
+                p.requires_grad_(True)
+                unfrozen_count += 1
+        if is_main_process:
+            print(
+                f"trainable_modules={train_cfg.trainable_modules!r}: "
+                f"{unfrozen_count:,}/{total_count:,} parameters trainable."
+            )
+
     train_model = raw_model
     if train_cfg.compile_model:
         if not hasattr(torch, "compile"):
@@ -2016,6 +2280,7 @@ def main() -> None:
 
     try:
         model.train()
+        optimizer_set_train_mode(optimizer, True)
         if scheduler is not None and step == 0:
             # Ensure the very first optimizer step uses warmup-scaled LR.
             scheduler.step()
@@ -2039,6 +2304,11 @@ def main() -> None:
                     caption_ids = batch["caption_ids"].to(device, non_blocking=True)
                     caption_mask = batch["caption_mask"].to(device, non_blocking=True)
                     has_caption = batch["has_caption"].to(device, non_blocking=True)
+                character_images = None
+                has_image = None
+                if raw_model.cfg.use_character_condition:
+                    character_images = batch["character_images"].to(device, non_blocking=True)
+                    has_image = batch["has_image"].to(device, non_blocking=True)
                 x0 = batch["latent_patched"].to(device, non_blocking=True)
                 x_mask = batch["latent_mask_patched"].to(device, non_blocking=True)
                 x_mask_valid = batch["latent_mask_valid_patched"].to(device, non_blocking=True)
@@ -2090,6 +2360,21 @@ def main() -> None:
                     use_caption = has_caption & (~caption_cond_drop)
                     caption_mask = caption_mask & use_caption[:, None]
 
+                character_cond_drop = None
+                if raw_model.cfg.use_character_condition:
+                    if has_image is None or character_images is None:
+                        raise RuntimeError(
+                            "Character conditioning is enabled but character batch tensors are missing."
+                        )
+                    character_cond_drop = (
+                        torch.rand(bsz, device=device) < train_cfg.character_condition_dropout
+                    )
+                    use_image = has_image & (~character_cond_drop)
+                    # Fill dropped/missing character images (unconditional).
+                    character_images = apply_unconditional_fill(
+                        character_images, use_image, train_cfg.character_unconditional_fill
+                    )
+
                 if raw_model.cfg.use_speaker_condition:
                     speaker_cond_drop = (
                         torch.rand(bsz, device=device) < train_cfg.speaker_condition_dropout
@@ -2115,6 +2400,7 @@ def main() -> None:
                             ref_mask=ref_mask,
                             caption_input_ids=caption_ids,
                             caption_mask=caption_mask,
+                            character_images=character_images,
                             latent_mask=x_mask,
                             text_condition_dropout=None,
                             speaker_condition_dropout=None,
@@ -2205,6 +2491,7 @@ def main() -> None:
                     and train_cfg.valid_every > 0
                     and step % train_cfg.valid_every == 0
                 ):
+                    optimizer_set_train_mode(optimizer, False)
                     valid_metrics = run_validation(
                         model=model,
                         loader=valid_loader,
@@ -2213,6 +2500,7 @@ def main() -> None:
                         use_bf16=use_bf16,
                         distributed=distributed,
                     )
+                    optimizer_set_train_mode(optimizer, True)
                     if is_main_process:
                         progress.write(
                             ("valid step={} loss={:.6f} rf={:.6f} (samples={:.0f})").format(
@@ -2251,6 +2539,31 @@ def main() -> None:
                                 )
                             )
 
+                if (
+                    train_cfg.preview_every > 0
+                    and step % train_cfg.preview_every == 0
+                    and is_main_process
+                    and preview_codec is not None
+                ):
+                    optimizer_set_train_mode(optimizer, False)
+                    parsed_previews = [
+                        PreviewSampleConfig(**d) for d in (train_cfg.preview_samples or [])
+                    ]
+                    run_preview(
+                        model=raw_model,
+                        model_cfg=model_cfg,
+                        samples=parsed_previews,
+                        codec=preview_codec,
+                        device=device,
+                        use_bf16=use_bf16,
+                        step=step,
+                        tokenizer=tokenizer,
+                        caption_tokenizer=caption_tokenizer,
+                        character_image_transform=character_image_transform,
+                        wandb_run=wandb_run,
+                    )
+                    optimizer_set_train_mode(optimizer, True)
+
                 if step >= train_cfg.max_steps:
                     break
 
@@ -2259,6 +2572,7 @@ def main() -> None:
             and train_cfg.valid_every > 0
             and step % train_cfg.valid_every != 0
         ):
+            optimizer_set_train_mode(optimizer, False)
             valid_metrics = run_validation(
                 model=model,
                 loader=valid_loader,
@@ -2267,6 +2581,7 @@ def main() -> None:
                 use_bf16=use_bf16,
                 distributed=distributed,
             )
+            optimizer_set_train_mode(optimizer, True)
             if is_main_process:
                 progress.write(
                     ("valid final step={} loss={:.6f} rf={:.6f} (samples={:.0f})").format(

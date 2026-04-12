@@ -1,0 +1,91 @@
+model:
+  latent_dim: 32
+  latent_patch_size: 1
+  text_vocab_size: 99574
+  text_tokenizer_repo: llm-jp/llm-jp-3-150m
+  model_dim: 1280
+  num_layers: 12
+  num_heads: 20
+  mlp_ratio: 2.875
+  text_mlp_ratio: 2.6
+  text_dim: 512
+  text_layers: 10
+  text_heads: 8
+  # Character reference conditioning (disables speaker conditioning)
+  use_character_condition: true
+  character_encoder_model: hf_hub:SmilingWolf/wd-swinv2-tagger-v3
+  character_dim: 512
+  character_use_all_patches: true
+  character_image_size: 448
+  character_projector:
+    type: mlp
+    hidden_dim: 512
+    num_layers: 1
+  # Speaker encoder kept for architecture consistency but disabled via use_speaker_condition
+  speaker_mlp_ratio: 2.6
+  speaker_dim: 768
+  speaker_layers: 8
+  speaker_heads: 12
+  speaker_patch_size: 1
+  timestep_embed_dim: 512
+  adaln_rank: 192
+
+train:
+  batch_size: 64
+  gradient_accumulation_steps: 1
+  num_workers: 16
+  dataloader_persistent_workers: true
+  dataloader_prefetch_factor: 4
+  allow_tf32: true
+  compile_model: false
+  precision: fp32
+  # optimizer / learning rate
+  optimizer: radam_schedule_free
+  # muon_momentum: 0.95
+  learning_rate: 0.01
+  weight_decay: 0.01
+  lr_scheduler: none # none, cosine, wsd
+  # warmup_steps: 1000
+  # stable_steps: 44000
+  # min_lr_scale: 0.01
+  adam_beta1: 0.9
+  adam_beta2: 0.99
+  adam_eps: 1e-08
+  # 
+  max_steps: 50000
+  #
+  max_text_len: 256
+  text_condition_dropout: 0.1
+  character_condition_dropout: 0.1
+  character_unconditional_fill: zero  # zero, randn, rand
+  # 
+  timestep_stratified: true
+  max_latent_steps: 750
+  fixed_target_latent_steps: 750
+  fixed_target_full_mask: true
+  # 
+  log_every: 100
+  save_every: 1000
+  checkpoint_best_n: 5
+  # 
+  wandb_enabled: false
+  wandb_project:
+  # wandb_entity:
+  # wandb_run_name:
+  wandb_mode: online
+  # 
+  ddp_find_unused_parameters: false
+  # 
+  valid_ratio: 0.0005
+  valid_every: 1000
+  seed: 0
+  # Preview generation during training (requires wandb_enabled: true to log audio)
+  preview_every: 0
+  preview_samples:
+    - text: こんにちは、今日はいい天気ですね。
+      image_path: /path/to/character_reference.png
+      num_steps: 20
+      cfg_guidance_mode: independent # joint, alternating
+      cfg_scale_text: 3.0
+      cfg_scale_character: 3.0
+      seed: 0

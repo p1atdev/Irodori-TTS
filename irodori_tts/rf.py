@@ -124,10 +124,13 @@ def sample_euler_rf_cfg(
     sequence_length: int,
     caption_input_ids: torch.Tensor | None = None,
     caption_mask: torch.Tensor | None = None,
+    character_images: torch.Tensor | None = None,
+    character_mask: torch.Tensor | None = None,
     num_steps: int = 40,
     cfg_scale_text: float = 3.0,
     cfg_scale_caption: float = 3.0,
     cfg_scale_speaker: float = 5.0,
+    cfg_scale_character: float = 3.0,
     cfg_guidance_mode: str = "independent",
     cfg_min_t: float = 0.5,
     cfg_max_t: float = 1.0,
@@ -166,9 +169,12 @@ def sample_euler_rf_cfg(
         cfg_scale_text = float(cfg_scale)
         cfg_scale_caption = float(cfg_scale)
         cfg_scale_speaker = float(cfg_scale)
+        cfg_scale_character = float(cfg_scale)
     if not model.cfg.use_speaker_condition:
         cfg_scale_speaker = 0.0
         speaker_kv_scale = None
+    if not model.cfg.use_character_condition:
+        cfg_scale_character = 0.0
 
     cfg_guidance_mode = str(cfg_guidance_mode).strip().lower()
     if cfg_guidance_mode not in {"independent", "joint", "alternating"}:
@@ -190,6 +196,8 @@ def sample_euler_rf_cfg(
         speaker_mask_cond,
         caption_state_cond,
         caption_mask_cond,
+        character_state_cond,
+        character_mask_cond,
     ) = model.encode_conditions(
         text_input_ids=text_input_ids,
         text_mask=text_mask,
@@ -197,10 +205,12 @@ def sample_euler_rf_cfg(
         speaker_mask=ref_mask,
         caption_input_ids=caption_input_ids,
         caption_mask=caption_mask,
+        character_images=character_images,
+        character_mask=character_mask,
     )
     text_state_uncond = torch.zeros_like(text_state_cond)
     text_mask_uncond = torch.zeros_like(text_mask_cond)
-    
+
     speaker_state_uncond = None
     speaker_mask_uncond = None
     if model.cfg.use_speaker_condition:
@@ -210,7 +220,7 @@ def sample_euler_rf_cfg(
             )
         speaker_state_uncond = torch.zeros_like(speaker_state_cond)
         speaker_mask_uncond = torch.zeros_like(speaker_mask_cond)
-    
+
     caption_state_uncond = None
     caption_mask_uncond = None
     if model.cfg.use_caption_condition:
@@ -221,6 +231,16 @@ def sample_euler_rf_cfg(
         caption_state_uncond = torch.zeros_like(caption_state_cond)
         caption_mask_uncond = torch.zeros_like(caption_mask_cond)
 
+    character_state_uncond = None
+    character_mask_uncond = None
+    if model.cfg.use_character_condition:
+        if character_state_cond is None or character_mask_cond is None:
+            raise RuntimeError(
+                "Character conditioning is enabled but encoded character state is missing."
+            )
+        character_state_uncond = torch.zeros_like(character_state_cond)
+        character_mask_uncond = torch.zeros_like(character_mask_cond)
+
     has_text_cfg = cfg_scale_text > 0
     has_caption_cfg = (
         model.cfg.use_caption_condition
@@ -229,6 +249,12 @@ def sample_euler_rf_cfg(
         and bool(caption_mask_cond.any().item())
     )
     has_speaker_cfg = cfg_scale_speaker > 0
+    has_character_cfg = (
+        model.cfg.use_character_condition
+        and cfg_scale_character > 0
+        and character_mask_cond is not None
+        and bool(character_mask_cond.any().item())
+    )
 
     def _bundle(
         *,
@@ -238,9 +264,13 @@ def sample_euler_rf_cfg(
         speaker_mask_val: torch.Tensor | None,
         caption_state: torch.Tensor | None,
         caption_mask_val: torch.Tensor | None,
+        character_state: torch.Tensor | None = None,
+        character_mask_val: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
         torch.Tensor | None,
         torch.Tensor | None,
         torch.Tensor | None,
@@ -253,6 +283,8 @@ def sample_euler_rf_cfg(
             speaker_mask_val,
             caption_state,
             caption_mask_val,
+            character_state,
+            character_mask_val,
         )
 
     cond_bundle = _bundle(
@@ -262,6 +294,8 @@ def sample_euler_rf_cfg(
         speaker_mask_val=speaker_mask_cond,
         caption_state=caption_state_cond,
         caption_mask_val=caption_mask_cond,
+        character_state=character_state_cond,
+        character_mask_val=character_mask_cond,
     )
     enabled_cfg_names: list[str] = []
     cfg_scales: dict[str, float] = {}
@@ -274,6 +308,9 @@ def sample_euler_rf_cfg(
     if has_caption_cfg:
         enabled_cfg_names.append("caption")
         cfg_scales["caption"] = float(cfg_scale_caption)
+    if has_character_cfg:
+        enabled_cfg_names.append("character")
+        cfg_scales["character"] = float(cfg_scale_character)
 
     independent_bundles = [cond_bundle]
     independent_names = ["cond"]
@@ -296,6 +333,12 @@ def sample_euler_rf_cfg(
                     caption_mask_val=(
                         caption_mask_uncond if name == "caption" else caption_mask_cond
                     ),
+                    character_state=(
+                        character_state_uncond if name == "character" else character_state_cond
+                    ),
+                    character_mask_val=(
+                        character_mask_uncond if name == "character" else character_mask_cond
+                    ),
                 )
             )
 
@@ -315,6 +358,8 @@ def sample_euler_rf_cfg(
     independent_speaker_mask = _cat_optional_tensors([bundle[3] for bundle in independent_bundles])
     independent_caption_state = _cat_optional_tensors([bundle[4] for bundle in independent_bundles])
     independent_caption_mask = _cat_optional_tensors([bundle[5] for bundle in independent_bundles])
+    independent_character_state = _cat_optional_tensors([bundle[6] for bundle in independent_bundles])
+    independent_character_mask = _cat_optional_tensors([bundle[7] for bundle in independent_bundles])
 
     joint_uncond_bundle = _bundle(
         text_state=text_state_uncond,
@@ -323,19 +368,11 @@ def sample_euler_rf_cfg(
         speaker_mask_val=speaker_mask_uncond,
         caption_state=caption_state_uncond,
         caption_mask_val=caption_mask_uncond,
+        character_state=character_state_uncond,
+        character_mask_val=character_mask_uncond,
     )
 
-    alternating_bundles: dict[
-        str,
-        tuple[
-            torch.Tensor,
-            torch.Tensor,
-            torch.Tensor | None,
-            torch.Tensor | None,
-            torch.Tensor | None,
-            torch.Tensor | None,
-        ],
-    ] = {
+    alternating_bundles: dict[str, tuple] = {
         "text": _bundle(
             text_state=text_state_uncond,
             text_mask_val=text_mask_uncond,
@@ -343,6 +380,8 @@ def sample_euler_rf_cfg(
             speaker_mask_val=speaker_mask_cond,
             caption_state=caption_state_cond,
             caption_mask_val=caption_mask_cond,
+            character_state=character_state_cond,
+            character_mask_val=character_mask_cond,
         ),
         "caption": _bundle(
             text_state=text_state_cond,
@@ -351,6 +390,18 @@ def sample_euler_rf_cfg(
             speaker_mask_val=speaker_mask_cond,
             caption_state=caption_state_uncond,
             caption_mask_val=caption_mask_uncond,
+            character_state=character_state_cond,
+            character_mask_val=character_mask_cond,
+        ),
+        "character": _bundle(
+            text_state=text_state_cond,
+            text_mask_val=text_mask_cond,
+            speaker_state=speaker_state_cond,
+            speaker_mask_val=speaker_mask_cond,
+            caption_state=caption_state_cond,
+            caption_mask_val=caption_mask_cond,
+            character_state=character_state_uncond,
+            character_mask_val=character_mask_uncond,
         ),
     }
     if has_speaker_cfg:
@@ -361,6 +412,8 @@ def sample_euler_rf_cfg(
             speaker_mask_val=speaker_mask_uncond,
             caption_state=caption_state_cond,
             caption_mask_val=caption_mask_cond,
+            character_state=character_state_cond,
+            character_mask_val=character_mask_cond,
         )
 
     # Force-speaker scaling operates on projected speaker K/V, so it requires context KV caches.
@@ -375,12 +428,14 @@ def sample_euler_rf_cfg(
             text_state=text_state_cond,
             speaker_state=speaker_state_cond,
             caption_state=caption_state_cond,
+            character_state=character_state_cond,
         )
         if use_independent_cfg and cfg_batch_mult > 1:
             context_kv_cfg = model.build_context_kv_cache(
                 text_state=independent_text_state,
                 speaker_state=independent_speaker_state,
                 caption_state=independent_caption_state,
+                character_state=independent_character_state,
             )
         elif use_joint_cfg:
             if enabled_cfg_names:
@@ -388,6 +443,7 @@ def sample_euler_rf_cfg(
                     text_state=joint_uncond_bundle[0],
                     speaker_state=joint_uncond_bundle[2],
                     caption_state=joint_uncond_bundle[4],
+                    character_state=joint_uncond_bundle[6],
                 )
         elif use_alternating_cfg:
             for name in enabled_cfg_names:
@@ -396,6 +452,7 @@ def sample_euler_rf_cfg(
                     text_state=bundle[0],
                     speaker_state=bundle[2],
                     caption_state=bundle[4],
+                    character_state=bundle[6],
                 )
 
     if speaker_kv_scale is not None:
@@ -439,6 +496,8 @@ def sample_euler_rf_cfg(
                     caption_state=independent_caption_state,
                     caption_mask=independent_caption_mask,
                     context_kv_cache=context_kv_cfg,
+                    character_state=independent_character_state,
+                    character_mask=independent_character_mask,
                 )
                 chunks = v_out.chunk(cfg_batch_mult, dim=0)
                 v = chunks[0]
@@ -455,6 +514,8 @@ def sample_euler_rf_cfg(
                     caption_state=caption_state_cond,
                     caption_mask=caption_mask_cond,
                     context_kv_cache=context_kv_cond,
+                    character_state=character_state_cond,
+                    character_mask=character_mask_cond,
                 )
                 if use_joint_cfg:
                     if len(enabled_cfg_names) > 1:
@@ -475,6 +536,8 @@ def sample_euler_rf_cfg(
                         caption_state=joint_uncond_bundle[4],
                         caption_mask=joint_uncond_bundle[5],
                         context_kv_cache=context_kv_joint_uncond,
+                        character_state=joint_uncond_bundle[6],
+                        character_mask=joint_uncond_bundle[7],
                     )
                     v = v_cond + joint_scale * (v_cond - v_uncond_joint)
                 elif use_alternating_cfg:
@@ -490,6 +553,8 @@ def sample_euler_rf_cfg(
                         caption_state=alt_bundle[4],
                         caption_mask=alt_bundle[5],
                         context_kv_cache=context_kv_alternating.get(alt_name),
+                        character_state=alt_bundle[6],
+                        character_mask=alt_bundle[7],
                     )
                     v = v_cond + cfg_scales[alt_name] * (v_cond - v_uncond_alt)
                 else:
@@ -505,6 +570,8 @@ def sample_euler_rf_cfg(
                 caption_state=caption_state_cond,
                 caption_mask=caption_mask_cond,
                 context_kv_cache=context_kv_cond,
+                character_state=character_state_cond,
+                character_mask=character_mask_cond,
             )
 
         if rescale_k is not None and rescale_sigma is not None:

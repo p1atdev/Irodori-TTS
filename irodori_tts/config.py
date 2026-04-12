@@ -5,6 +5,16 @@ from typing import Any, TypeVar
 
 
 @dataclass
+class CharacterProjectorConfig:
+    """Configuration for the character image projector module."""
+
+    type: str = "mlp"
+    hidden_dim: int | None = None
+    # Number of MLP blocks. One block is: Linear -> SiLU -> Linear.
+    num_layers: int = 1
+
+
+@dataclass
 class ModelConfig:
     latent_dim: int = 128
     latent_patch_size: int = 1
@@ -29,6 +39,12 @@ class ModelConfig:
     caption_layers: int | None = None
     caption_heads: int | None = None
     caption_mlp_ratio: float | None = None
+    use_character_condition: bool = False
+    character_encoder_model: str | None = None
+    character_dim: int | None = None
+    character_use_all_patches: bool = True
+    character_image_size: int = 448
+    character_projector: dict | None = None
     speaker_dim: int = 1280
     speaker_layers: int = 14
     speaker_heads: int = 10
@@ -47,9 +63,9 @@ class ModelConfig:
 
     @property
     def use_speaker_condition(self) -> bool:
-        # Voice-design checkpoints are caption-driven and intentionally omit
-        # reference-speaker conditioning to avoid the easier shortcut.
-        return not bool(self.use_caption_condition)
+        # Caption and character conditioning both serve as identity anchors that
+        # intentionally replace reference-speaker audio to avoid the easier shortcut.
+        return not bool(self.use_caption_condition) and not bool(self.use_character_condition)
 
     @property
     def text_mlp_ratio_resolved(self) -> float:
@@ -100,6 +116,18 @@ class ModelConfig:
         return float(self.caption_mlp_ratio)
 
     @property
+    def character_dim_resolved(self) -> int:
+        if self.character_dim is None:
+            return int(self.text_dim)
+        return int(self.character_dim)
+
+    @property
+    def character_projector_resolved(self) -> CharacterProjectorConfig:
+        if self.character_projector is None:
+            return CharacterProjectorConfig()
+        return CharacterProjectorConfig(**self.character_projector)
+
+    @property
     def speaker_mlp_ratio_resolved(self) -> float:
         if self.speaker_mlp_ratio is None:
             return self.mlp_ratio
@@ -145,6 +173,9 @@ class TrainConfig:
     max_caption_len: int | None = None
     text_condition_dropout: float = 0.1
     caption_condition_dropout: float = 0.1
+    character_condition_dropout: float = 0.1
+    max_character_patches: int | None = None
+    character_unconditional_fill: str = "zero"
     speaker_condition_dropout: float = 0.1
     max_latent_steps: int = 750
     fixed_target_latent_steps: int | None = 750
@@ -166,7 +197,10 @@ class TrainConfig:
     lora_dropout: float = 0.0
     lora_bias: str = "none"
     lora_target_modules: str = "diffusion_attn"
+    trainable_modules: list | None = None
     seed: int = 0
+    preview_every: int = 0
+    preview_samples: list | None = None
 
 
 @dataclass
@@ -174,6 +208,7 @@ class SamplingConfig:
     num_steps: int = 40
     cfg_scale_text: float = 3.0
     cfg_scale_caption: float = 3.0
+    cfg_scale_character: float = 3.0
     cfg_scale_speaker: float = 5.0
     cfg_guidance_mode: str = "independent"
     cfg_scale: float | None = None

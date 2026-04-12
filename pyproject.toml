@@ -24,6 +24,7 @@ dependencies = [
     "tqdm>=4.67.3",
     "wandb>=0.17.0",
     "schedulefree>=1.4.1",
+    "timm>=1.0.26",
 ]
 
 
