@@ -1045,6 +1045,57 @@ class PreviewSampleConfig:
     seed: int = 0
 
 
+def parse_preview_samples(preview_samples: list | None) -> list[PreviewSampleConfig]:
+    """Normalize preview sample config entries into dataclass instances."""
+    parsed: list[PreviewSampleConfig] = []
+    for idx, sample in enumerate(preview_samples or []):
+        if isinstance(sample, PreviewSampleConfig):
+            parsed.append(sample)
+            continue
+        if not isinstance(sample, dict):
+            raise ValueError(
+                "preview_samples entries must be dictionaries, "
+                f"got {type(sample)!r} at index {idx}."
+            )
+        parsed.append(PreviewSampleConfig(**sample))
+    return parsed
+
+
+def load_preview_reference_image(image_path: str | None):
+    """Load a preview reference image from disk, returning RGB PIL image or None."""
+    image_path_str = "" if image_path is None else str(image_path).strip()
+    if not image_path_str:
+        return None
+    return PILImage.open(Path(image_path_str).expanduser()).convert("RGB")
+
+
+def log_preview_reference_images(
+    *,
+    samples: list[PreviewSampleConfig],
+    wandb_run,
+    step: int = 0,
+) -> None:
+    """Log preview reference images to W&B once at startup."""
+    if wandb_run is None:
+        return
+
+    image_logs: dict[str, wandb.Image] = {}
+    for i, cfg in enumerate(samples):
+        try:
+            image = load_preview_reference_image(cfg.image_path)
+            if image is None:
+                continue
+            caption = cfg.text[:120]
+            if cfg.image_path:
+                caption = f"{caption}\nref={cfg.image_path}"
+            image_logs[f"preview/reference_image_{i}"] = wandb.Image(image, caption=caption)
+        except Exception as exc:
+            print(f"preview reference image {i} failed to load: {exc}")
+
+    if image_logs:
+        wandb_run.log(image_logs, step=step)
+
+
 def run_preview(
     *,
     model,
@@ -1103,8 +1154,9 @@ def run_preview(
                 # 4. Character reference image
                 character_images = None
                 if model_cfg.use_character_condition:
-                    if cfg.image_path and character_image_transform is not None:
-                        img = PILImage.open(cfg.image_path).convert("RGB")
+                    preview_image = load_preview_reference_image(cfg.image_path)
+                    if preview_image is not None and character_image_transform is not None:
+                        img = preview_image
                         img_tensor = character_image_transform(img).unsqueeze(0).to(device)
                         character_images = img_tensor
                     else:
@@ -1168,7 +1220,7 @@ def run_preview(
                     audio = audio[0]
                 audio_np = audio.cpu().float().numpy()
 
-                key = f"preview/{i}"
+                key = f"preview/audio_{i}"
                 try:
                     audio_logs[key] = wandb.Audio(
                         audio_np, sample_rate=codec.sample_rate, caption=cfg.text[:120]
@@ -1816,6 +1868,8 @@ def main() -> None:
     elif train_cfg.allow_tf32 and is_main_process:
         print("warning: allow_tf32=True requested on non-CUDA device; ignoring.")
 
+    parsed_previews = parse_preview_samples(train_cfg.preview_samples)
+
     output_dir = Path(train_cfg.output_dir)
     if is_main_process:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -1842,6 +1896,7 @@ def main() -> None:
         print(
             f"W&B enabled: project={train_cfg.wandb_project} mode={train_cfg.wandb_mode} run={wandb_run.name if wandb_run is not None else train_cfg.wandb_run_name}"
         )
+        log_preview_reference_images(samples=parsed_previews, wandb_run=wandb_run, step=0)
 
     if distributed:
         local_files_only = not is_main_process
@@ -2052,7 +2107,7 @@ def main() -> None:
 
     # Codec for preview generation (only on main process, since previewing is for logging).
     preview_codec = None
-    if train_cfg.preview_every > 0 and train_cfg.preview_samples and is_main_process:
+    if train_cfg.preview_every > 0 and parsed_previews and is_main_process:
         preview_codec = DACVAECodec.load(device=str(device))
 
     has_validation = valid_loader is not None and train_cfg.valid_every > 0
@@ -2546,9 +2601,6 @@ def main() -> None:
                     and preview_codec is not None
                 ):
                     optimizer_set_train_mode(optimizer, False)
-                    parsed_previews = [
-                        PreviewSampleConfig(**d) for d in (train_cfg.preview_samples or [])
-                    ]
                     run_preview(
                         model=raw_model,
                         model_cfg=model_cfg,
