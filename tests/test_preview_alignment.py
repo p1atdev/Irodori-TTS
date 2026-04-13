@@ -12,6 +12,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import train
 from irodori_tts.config import ModelConfig, TrainConfig
+from irodori_tts.generation_core import SamplingResult
 
 
 class DummyModel:
@@ -25,30 +26,11 @@ class DummyModel:
         self.training = True
 
 
-class RecordingTokenizer:
-    def __init__(self) -> None:
-        self.calls: list[tuple[list[str], int]] = []
-
-    def batch_encode(self, texts, max_length: int):
-        texts = list(texts)
-        self.calls.append((texts, int(max_length)))
-        batch_size = len(texts)
-        ids = torch.zeros((batch_size, max_length), dtype=torch.long)
-        mask = torch.ones((batch_size, max_length), dtype=torch.bool)
-        return ids, mask
-
-
 class DummyCodec:
     def __init__(self) -> None:
         self.sample_rate = 10
+        self.device = torch.device("cpu")
         self.model = type("DummyCodecModel", (), {"hop_length": 4})()
-        self.decode_inputs: list[torch.Tensor] = []
-
-    def decode_latent(self, latent: torch.Tensor) -> torch.Tensor:
-        self.decode_inputs.append(latent.detach().clone())
-        batch_size = latent.shape[0]
-        audio_len = latent.shape[1] * 10
-        return torch.arange(audio_len, dtype=torch.float32).view(1, 1, -1).repeat(batch_size, 1, 1)
 
 
 class DummyWandbRun:
@@ -81,27 +63,51 @@ def test_resolve_preview_sequence_lengths_uses_ceil_rules() -> None:
     assert patched_steps == 2
 
 
-def test_run_preview_uses_runtime_text_rules_and_crops_output(monkeypatch) -> None:
+def test_preview_sample_to_sampling_request_uses_normalized_text_for_length_estimate() -> None:
+    request, normalized_text = train.preview_sample_to_sampling_request(
+        train.PreviewSampleConfig(
+            text="　（テスト？）\t",
+            caption="  cap  ",
+            seconds=None,
+            num_steps=2,
+            seed=123,
+        )
+    )
+
+    assert normalized_text == "テスト?"
+    assert request.text == "　（テスト？）\t"
+    assert request.caption == "  cap  "
+    assert request.seconds == 2.0
+    assert request.seed == 123
+    assert request.trim_tail is False
+
+
+def test_run_preview_delegates_to_shared_core_and_logs_audio(monkeypatch) -> None:
     model_cfg = ModelConfig(
         latent_dim=2,
         latent_patch_size=2,
         use_caption_condition=True,
     )
-    train_cfg = TrainConfig(max_text_len=7, max_caption_len=None)
+    train_cfg = TrainConfig(max_text_len=7, max_caption_len=None, fixed_target_latent_steps=11)
     model = DummyModel()
-    tokenizer = RecordingTokenizer()
-    caption_tokenizer = RecordingTokenizer()
     codec = DummyCodec()
     wandb_run = DummyWandbRun()
+    captured: dict[str, object] = {}
 
-    monkeypatch.setattr(
-        train,
-        "sample_euler_rf_cfg",
-        lambda **kwargs: torch.zeros(
-            (1, kwargs["sequence_length"], model_cfg.patched_latent_dim),
-            dtype=torch.float32,
-        ),
-    )
+    def fake_generate_from_components(**kwargs):
+        captured.update(kwargs)
+        audio = torch.arange(9, dtype=torch.float32).view(1, -1)
+        return SamplingResult(
+            audio=audio,
+            audios=[audio],
+            sample_rate=codec.sample_rate,
+            stage_timings=[("stub", 0.01)],
+            total_to_decode=0.01,
+            used_seed=123,
+            messages=[],
+        )
+
+    monkeypatch.setattr(train, "generate_from_components", fake_generate_from_components)
     monkeypatch.setattr(
         train.wandb,
         "Audio",
@@ -120,24 +126,32 @@ def test_run_preview_uses_runtime_text_rules_and_crops_output(monkeypatch) -> No
             train.PreviewSampleConfig(
                 text="　（テスト？）\t",
                 caption="  cap  ",
-                seconds=0.9,
+                seconds=None,
                 num_steps=2,
+                seed=123,
             )
         ],
         codec=codec,
         device=torch.device("cpu"),
         use_bf16=False,
         step=12,
-        tokenizer=tokenizer,
-        caption_tokenizer=caption_tokenizer,
+        tokenizer=object(),
+        caption_tokenizer=object(),
         character_image_transform=None,
         wandb_run=wandb_run,
     )
 
-    assert tokenizer.calls == [(["テスト?"], 7)]
-    assert caption_tokenizer.calls == [(["cap"], 7)]
-    assert len(codec.decode_inputs) == 1
-    assert tuple(codec.decode_inputs[0].shape) == (1, 3, 2)
+    request = captured["request"]
+    assert isinstance(request, train.SamplingRequest)
+    assert request.text == "　（テスト？）\t"
+    assert request.caption == "  cap  "
+    assert request.seconds == 2.0
+    assert request.trim_tail is False
+    assert request.seed == 123
+    assert captured["default_text_max_len"] == 7
+    assert captured["default_caption_max_len"] == 7
+    assert captured["fixed_target_latent_steps"] == 11
+    assert captured["codec_device"] == torch.device("cpu")
     assert len(wandb_run.records) == 1
 
     payload, step = wandb_run.records[0]

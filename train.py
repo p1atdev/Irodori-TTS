@@ -16,7 +16,6 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
-import torchaudio
 import wandb
 from safetensors import safe_open
 from safetensors.torch import load_file as load_safetensors_file
@@ -24,7 +23,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 from transformers import AutoConfig, AutoModel
 
-from irodori_tts.codec import DACVAECodec, patchify_latent, unpatchify_latent
+from irodori_tts.codec import DACVAECodec
 from irodori_tts.config import (
     ModelConfig,
     RegexModule,
@@ -34,6 +33,13 @@ from irodori_tts.config import (
     merge_dataclass_overrides,
 )
 from irodori_tts.dataset import LatentTextDataset, TTSCollator
+from irodori_tts.generation_core import (
+    SamplingRequest,
+    generate_from_components,
+    normalize_generation_text,
+    resolve_condition_lengths,
+    resolve_sequence_lengths,
+)
 from irodori_tts.image_encoder import build_character_transform, load_character_image
 from irodori_tts.lora import (
     LORA_METADATA_NAME,
@@ -52,11 +58,9 @@ from irodori_tts.progress import TrainProgress
 from irodori_tts.rf import (
     rf_interpolate,
     rf_velocity_target,
-    sample_euler_rf_cfg,
     sample_logit_normal_t,
     sample_stratified_logit_normal_t,
 )
-from irodori_tts.text_normalization import normalize_text
 from irodori_tts.tokenizer import PretrainedTextTokenizer
 
 WANDB_MODES = {"online", "offline", "disabled"}
@@ -1263,16 +1267,22 @@ def load_preview_reference_image(image_path: str | None):
 
 def normalize_preview_text(text: str) -> str:
     """Normalize preview text with the same rules used by runtime inference."""
-    return normalize_text(str(text)).strip()
+    return normalize_generation_text(text)
 
 
 def resolve_preview_condition_lengths(train_cfg: TrainConfig) -> tuple[int, int]:
     """Resolve preview token limits using the same fallback rules as inference."""
-    text_max_len = int(train_cfg.max_text_len)
-    caption_max_len = text_max_len
-    if train_cfg.max_caption_len is not None:
-        caption_max_len = int(train_cfg.max_caption_len)
-    return text_max_len, caption_max_len
+    default_caption_max_len = (
+        int(train_cfg.max_text_len)
+        if train_cfg.max_caption_len is None
+        else int(train_cfg.max_caption_len)
+    )
+    return resolve_condition_lengths(
+        default_text_max_len=int(train_cfg.max_text_len),
+        default_caption_max_len=default_caption_max_len,
+        max_text_len=None,
+        max_caption_len=None,
+    )
 
 
 def resolve_preview_sequence_lengths(
@@ -1283,29 +1293,57 @@ def resolve_preview_sequence_lengths(
     latent_patch_size: int,
 ) -> tuple[int, int, int]:
     """Resolve preview decode/sample lengths using inference-runtime style ceil rules."""
-    target_samples = int(float(seconds) * sample_rate)
-    latent_steps = max(1, -(-target_samples // int(hop_length)))
-    patched_steps = max(1, -(-latent_steps // int(latent_patch_size)))
-    return target_samples, latent_steps, patched_steps
-
-
-def decode_preview_audio(
-    *,
-    z_patched: torch.Tensor,
-    model_cfg: ModelConfig,
-    codec: DACVAECodec,
-    latent_steps: int,
-    target_samples: int,
-) -> torch.Tensor:
-    """Decode preview latents with the same latent/audio cropping rules as runtime."""
-    z = unpatchify_latent(
-        z_patched,
-        patch_size=model_cfg.latent_patch_size,
-        latent_dim=model_cfg.latent_dim,
+    return resolve_sequence_lengths(
+        seconds=seconds,
+        sample_rate=sample_rate,
+        hop_length=hop_length,
+        latent_patch_size=latent_patch_size,
     )
-    z = z[:, :latent_steps]
-    audio = codec.decode_latent(z)
-    return audio[..., :target_samples]
+
+
+def preview_sample_to_sampling_request(cfg: PreviewSampleConfig) -> tuple[SamplingRequest, str]:
+    """Convert preview config to the shared sampling request model."""
+    normalized_text = normalize_preview_text(cfg.text)
+    seconds = cfg.seconds
+    if seconds is None:
+        seconds = max(2.0, len(normalized_text) / 5.0 + 1.0)
+    return (
+        SamplingRequest(
+            text=str(cfg.text),
+            caption=cfg.caption,
+            ref_wav=cfg.ref_wav,
+            ref_latent=None,
+            no_ref=False,
+            ref_normalize_db=-16.0,
+            ref_ensure_max=True,
+            num_candidates=1,
+            decode_mode="sequential",
+            seconds=float(seconds),
+            max_ref_seconds=None,
+            max_text_len=None,
+            max_caption_len=None,
+            character_image=cfg.image_path,
+            num_steps=cfg.num_steps,
+            cfg_scale_text=cfg.cfg_scale_text,
+            cfg_scale_caption=cfg.cfg_scale_caption,
+            cfg_scale_character=cfg.cfg_scale_character,
+            cfg_scale_speaker=cfg.cfg_scale_speaker,
+            cfg_guidance_mode=cfg.cfg_guidance_mode,
+            cfg_scale=cfg.cfg_scale,
+            cfg_min_t=0.5,
+            cfg_max_t=1.0,
+            truncation_factor=cfg.truncation_factor,
+            rescale_k=cfg.rescale_k,
+            rescale_sigma=cfg.rescale_sigma,
+            context_kv_cache=True,
+            speaker_kv_scale=cfg.speaker_kv_scale,
+            speaker_kv_min_t=cfg.speaker_kv_min_t,
+            speaker_kv_max_layers=cfg.speaker_kv_max_layers,
+            seed=int(cfg.seed),
+            trim_tail=False,
+        ),
+        normalized_text,
+    )
 
 
 def log_preview_reference_images(
@@ -1355,116 +1393,29 @@ def run_preview(
     model.eval()
     audio_logs: dict = {}
     text_max_len, caption_max_len = resolve_preview_condition_lengths(train_cfg)
+    codec_device = getattr(codec, "device", device)
 
     with torch.no_grad():
         for i, cfg in enumerate(samples):
             try:
-                # 1. Tokenize text
-                normalized_text = normalize_preview_text(cfg.text)
-                if normalized_text == "":
-                    raise ValueError("preview text became empty after normalization")
-                text_ids, text_mask = tokenizer.batch_encode(
-                    [normalized_text], max_length=text_max_len
-                )
-                text_ids = text_ids.to(device)
-                text_mask = text_mask.to(device)
-
-                # 2. Caption
-                caption_ids = None
-                caption_mask = None
-                if model_cfg.use_caption_condition and caption_tokenizer is not None:
-                    caption_text = "" if cfg.caption is None else str(cfg.caption).strip()
-                    caption_ids, caption_mask = caption_tokenizer.batch_encode(
-                        [caption_text], max_length=caption_max_len
-                    )
-                    if not caption_text.strip():
-                        caption_mask.zero_()
-                    caption_ids = caption_ids.to(device)
-                    caption_mask = caption_mask.to(device)
-
-                # 3. Reference speaker audio
-                ref_latent = None
-                ref_mask = None
-                if model_cfg.use_speaker_condition and cfg.ref_wav:
-                    wav, sr = torchaudio.load(cfg.ref_wav)
-                    wav = wav.to(device)
-                    ref_raw = codec.encode_waveform(wav, sample_rate=sr)  # (1, T, D)
-                    ref_patched = patchify_latent(
-                        ref_raw, model_cfg.latent_patch_size
-                    )  # (1, T_p, D_p)
-                    ref_latent = ref_patched
-                    ref_mask = torch.ones(ref_patched.shape[:2], dtype=torch.bool, device=device)
-
-                # 4. Character reference image
-                character_images = None
-                if model_cfg.use_character_condition:
-                    preview_image = load_preview_reference_image(cfg.image_path)
-                    if preview_image is not None and character_image_transform is not None:
-                        img = preview_image
-                        img_tensor = character_image_transform(img).unsqueeze(0).to(device)
-                        character_images = img_tensor
-                    else:
-                        character_images = torch.zeros(
-                            1,
-                            3,
-                            model_cfg.character_image_size,
-                            model_cfg.character_image_size,
-                            device=device,
-                        )
-
-                # 5. Sequence length
-                seconds = cfg.seconds
-                if seconds is None:
-                    # Estimate from text length: ~5 chars/sec for Japanese, 1s padding
-                    seconds = max(2.0, len(normalized_text) / 5.0 + 1.0)
-                target_samples, latent_steps, seq_len = resolve_preview_sequence_lengths(
-                    seconds=seconds,
-                    sample_rate=codec.sample_rate,
-                    hop_length=int(codec.model.hop_length),
-                    latent_patch_size=model_cfg.latent_patch_size,
-                )
-
-                # 6. Sample
-                with (
-                    torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-                    if use_bf16
-                    else nullcontext()
-                ):
-                    z_patched = sample_euler_rf_cfg(
-                        model=model,
-                        text_input_ids=text_ids,
-                        text_mask=text_mask,
-                        ref_latent=ref_latent,
-                        ref_mask=ref_mask,
-                        sequence_length=seq_len,
-                        caption_input_ids=caption_ids,
-                        caption_mask=caption_mask,
-                        character_images=character_images,
-                        num_steps=cfg.num_steps,
-                        cfg_scale_text=cfg.cfg_scale_text,
-                        cfg_scale_caption=cfg.cfg_scale_caption,
-                        cfg_scale_speaker=cfg.cfg_scale_speaker,
-                        cfg_scale_character=cfg.cfg_scale_character,
-                        cfg_guidance_mode=cfg.cfg_guidance_mode,
-                        cfg_scale=cfg.cfg_scale,
-                        truncation_factor=cfg.truncation_factor,
-                        rescale_k=cfg.rescale_k,
-                        rescale_sigma=cfg.rescale_sigma,
-                        speaker_kv_scale=cfg.speaker_kv_scale,
-                        speaker_kv_max_layers=cfg.speaker_kv_max_layers,
-                        speaker_kv_min_t=cfg.speaker_kv_min_t,
-                        seed=cfg.seed,
-                    )
-
-                # 7. Decode
-                audio = decode_preview_audio(
-                    z_patched=z_patched,
+                request, normalized_text = preview_sample_to_sampling_request(cfg)
+                result = generate_from_components(
+                    model=model,
                     model_cfg=model_cfg,
+                    tokenizer=tokenizer,
+                    caption_tokenizer=caption_tokenizer,
                     codec=codec,
-                    latent_steps=latent_steps,
-                    target_samples=target_samples,
+                    request=request,
+                    default_text_max_len=text_max_len,
+                    default_caption_max_len=caption_max_len,
+                    character_image_transform=character_image_transform,
+                    model_device=device,
+                    codec_device=codec_device,
+                    use_bf16_autocast=use_bf16,
+                    fixed_target_latent_steps=train_cfg.fixed_target_latent_steps,
+                    log_fn=None,
                 )
-                audio_np = audio[0, 0].cpu().float().numpy()
+                audio_np = result.audio[0].cpu().float().numpy()
 
                 key = f"preview/audio_{i}"
                 try:

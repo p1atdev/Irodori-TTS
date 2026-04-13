@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import gc
 import json
-import math
-import secrets
 import threading
 import time
 from collections.abc import Callable
@@ -15,12 +13,11 @@ import torchaudio
 from safetensors import safe_open
 from safetensors.torch import load_file as load_safetensors_file
 
-from .codec import DACVAECodec, patchify_latent, unpatchify_latent
+from . import generation_core
+from .codec import DACVAECodec
 from .config import ModelConfig
 from .lora import checkpoint_state_uses_lora
 from .model import TextToLatentRFDiT
-from .rf import sample_euler_rf_cfg
-from .text_normalization import normalize_text
 from .tokenizer import PretrainedTextTokenizer
 
 
@@ -98,56 +95,6 @@ def _measure_end(device: torch.device, t0: float, *extra_devices: torch.device) 
     return time.perf_counter() - t0
 
 
-def _coerce_latent_shape(latent: torch.Tensor, latent_dim: int) -> torch.Tensor:
-    if latent.ndim == 3 and latent.shape[0] == 1:
-        latent = latent[0]
-    if latent.ndim != 2:
-        raise ValueError(f"Unsupported latent shape: {tuple(latent.shape)}")
-    if latent.shape[1] == latent_dim:
-        return latent
-    if latent.shape[0] == latent_dim:
-        return latent.transpose(0, 1).contiguous()
-    raise ValueError(
-        f"Could not infer latent layout for shape={tuple(latent.shape)} and latent_dim={latent_dim}"
-    )
-
-
-def find_flattening_point(
-    latent: torch.Tensor,
-    target_value: float = 0.0,
-    window_size: int = 20,
-    std_threshold: float = 0.05,
-    mean_threshold: float = 0.1,
-) -> int:
-    """
-    Echo-style heuristic: find first index where a trailing window becomes near-flat and near-zero.
-
-    Args:
-      latent: (T, D) latent sequence.
-    Returns:
-      Flattening index in [0, T].
-    """
-    if latent.ndim != 2:
-        raise ValueError(f"Expected latent shape (T, D), got {tuple(latent.shape)}")
-    total_steps = int(latent.shape[0])
-    if total_steps <= 0 or window_size <= 0:
-        return total_steps
-
-    pad = torch.zeros(
-        (window_size, latent.shape[1]),
-        device=latent.device,
-        dtype=latent.dtype,
-    )
-    padded = torch.cat([latent, pad], dim=0)
-    for i in range(padded.shape[0] - window_size):
-        window = padded[i : i + window_size]
-        window_std = window.std(unbiased=False)
-        window_mean = window.mean()
-        if window_std < std_threshold and torch.abs(window_mean - target_value) < mean_threshold:
-            return int(i)
-    return total_steps
-
-
 @dataclass(frozen=True)
 class RuntimeKey:
     checkpoint: str
@@ -161,56 +108,6 @@ class RuntimeKey:
     enable_watermark: bool = False
     compile_model: bool = False
     compile_dynamic: bool = False
-
-
-@dataclass
-class SamplingRequest:
-    text: str
-    caption: str | None = None
-    ref_wav: str | None = None
-    ref_latent: str | None = None
-    no_ref: bool = False
-    ref_normalize_db: float | None = -16.0
-    ref_ensure_max: bool = True
-    num_candidates: int = 1
-    decode_mode: str = "sequential"
-    seconds: float = 30.0
-    max_ref_seconds: float | None = 30.0
-    max_text_len: int | None = None
-    max_caption_len: int | None = None
-    character_image: str | None = None
-    num_steps: int = 40
-    cfg_scale_text: float = 3.0
-    cfg_scale_caption: float = 3.0
-    cfg_scale_character: float = 3.0
-    cfg_scale_speaker: float = 5.0
-    cfg_guidance_mode: str = "independent"
-    cfg_scale: float | None = None
-    cfg_min_t: float = 0.5
-    cfg_max_t: float = 1.0
-    truncation_factor: float | None = None
-    rescale_k: float | None = None
-    rescale_sigma: float | None = None
-    context_kv_cache: bool = True
-    speaker_kv_scale: float | None = None
-    speaker_kv_min_t: float | None = None
-    speaker_kv_max_layers: int | None = None
-    seed: int | None = None
-    trim_tail: bool = True
-    tail_window_size: int = 20
-    tail_std_threshold: float = 0.05
-    tail_mean_threshold: float = 0.1
-
-
-@dataclass
-class SamplingResult:
-    audio: torch.Tensor
-    audios: list[torch.Tensor]
-    sample_rate: int
-    stage_timings: list[tuple[str, float]]
-    total_to_decode: float
-    used_seed: int
-    messages: list[str]
 
 
 def _maybe_compile_inference_model(
@@ -244,52 +141,10 @@ def resolve_runtime_dtype(*, precision: str, device: torch.device) -> torch.dtyp
     raise ValueError(f"Unsupported precision={precision!r}. Expected one of: fp32, bf16.")
 
 
-def resolve_cfg_scales(
-    *,
-    cfg_guidance_mode: str,
-    cfg_scale_text: float,
-    cfg_scale_caption: float,
-    cfg_scale_speaker: float,
-    cfg_scale_character: float = 3.0,
-    cfg_scale: float | None,
-    use_caption_condition: bool = True,
-    use_speaker_condition: bool = True,
-    use_character_condition: bool = False,
-) -> tuple[float, float, float, float, list[str]]:
-    """Normalize/validate CFG scales for guidance mode."""
-    messages: list[str] = []
-    text_val = float(cfg_scale_text)
-    caption_val = float(cfg_scale_caption)
-    speaker_val = float(cfg_scale_speaker)
-    character_val = float(cfg_scale_character)
-
-    if cfg_scale is not None:
-        text_val = float(cfg_scale)
-        caption_val = float(cfg_scale)
-        speaker_val = float(cfg_scale)
-        character_val = float(cfg_scale)
-    if not use_speaker_condition:
-        if speaker_val > 0.0:
-            messages.append(
-                "info: speaker conditioning is disabled for this checkpoint; ignoring cfg_scale_speaker."
-            )
-        speaker_val = 0.0
-    if not use_character_condition:
-        character_val = 0.0
-
-    mode = str(cfg_guidance_mode).strip().lower()
-    enabled_vals = [value for value in (text_val, speaker_val) if value > 0.0]
-    if use_caption_condition and caption_val > 0.0:
-        enabled_vals.append(caption_val)
-    if use_character_condition and character_val > 0.0:
-        enabled_vals.append(character_val)
-    if mode == "joint" and enabled_vals and (max(enabled_vals) - min(enabled_vals) > 1e-6):
-        raise ValueError(
-            "cfg_guidance_mode='joint' requires equal enabled cfg_scale_text/cfg_scale_caption/cfg_scale_speaker/cfg_scale_character, "
-            "or set cfg_scale."
-        )
-
-    return text_val, caption_val, speaker_val, character_val, messages
+SamplingRequest = generation_core.SamplingRequest
+SamplingResult = generation_core.SamplingResult
+find_flattening_point = generation_core.find_flattening_point
+resolve_cfg_scales = generation_core.resolve_cfg_scales
 
 
 def _load_torch_checkpoint_payload(path: Path) -> dict:
@@ -528,100 +383,6 @@ class InferenceRuntime:
             character_image_transform=character_image_transform,
         )
 
-    def _load_reference_latent(
-        self,
-        *,
-        req: SamplingRequest,
-        batch_size: int,
-        messages: list[str],
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        runtime_dtype = next(self.model.parameters()).dtype
-        if not self.model_cfg.use_speaker_condition:
-            if req.ref_wav is not None or req.ref_latent is not None:
-                messages.append(
-                    "info: speaker conditioning is disabled for this checkpoint; ignoring reference input."
-                )
-            return None, None
-        if req.no_ref:
-            ref_len = max(1, int(self.model_cfg.speaker_patch_size))
-            ref_latent_patched = torch.zeros(
-                (
-                    batch_size,
-                    ref_len,
-                    self.model_cfg.latent_dim * self.model_cfg.latent_patch_size,
-                ),
-                device=self.model_device,
-                dtype=runtime_dtype,
-            )
-            ref_mask = torch.zeros(
-                (batch_size, ref_len), dtype=torch.bool, device=self.model_device
-            )
-            return ref_latent_patched, ref_mask
-
-        if req.ref_wav is None and req.ref_latent is None:
-            raise ValueError("Specify either ref_wav/ref_latent, or set no_ref=True.")
-
-        max_ref_latent_steps = None
-        if req.max_ref_seconds is not None and req.max_ref_seconds > 0:
-            max_ref_latent_steps = max(
-                1,
-                math.ceil(
-                    float(req.max_ref_seconds)
-                    * float(self.codec.sample_rate)
-                    / float(int(self.codec.model.hop_length))
-                ),
-            )
-
-        if req.ref_latent is not None:
-            latent_raw = torch.load(req.ref_latent, map_location="cpu", weights_only=True)
-            ref_latent = _coerce_latent_shape(
-                latent_raw, latent_dim=self.model_cfg.latent_dim
-            ).unsqueeze(0)
-            ref_latent = ref_latent.to(dtype=runtime_dtype)
-        else:
-            wav, sr = _load_audio(req.ref_wav)
-            if req.max_ref_seconds is not None and req.max_ref_seconds > 0:
-                max_ref_samples = max(1, int(float(req.max_ref_seconds) * float(sr)))
-                if wav.shape[1] > max_ref_samples:
-                    messages.append(
-                        f"warning: reference audio exceeds max_ref_seconds ({req.max_ref_seconds}s). "
-                        f"Trimming from {float(wav.shape[1]) / float(sr):.2f}s to {float(max_ref_samples) / float(sr):.2f}s."
-                    )
-                    wav = wav[:, :max_ref_samples]
-            if req.ref_normalize_db is not None:
-                messages.append(
-                    f"info: reference loudness normalize enabled (target_db={float(req.ref_normalize_db):.2f}, includes peak safety scaling)."
-                )
-            elif req.ref_ensure_max:
-                messages.append("info: reference peak safety scaling enabled (ensure_max=True).")
-            ref_latent = self.codec.encode_waveform(
-                wav.unsqueeze(0),
-                sample_rate=int(sr),
-                normalize_db=req.ref_normalize_db,
-                ensure_max=bool(req.ref_ensure_max),
-            ).cpu()
-
-        if max_ref_latent_steps is not None and ref_latent.shape[1] > max_ref_latent_steps:
-            messages.append(
-                f"warning: reference latent steps ({ref_latent.shape[1]}) exceed max_ref_seconds bound ({max_ref_latent_steps} steps). "
-                "Trimming reference latent."
-            )
-            ref_latent = ref_latent[:, :max_ref_latent_steps]
-
-        ref_latent_patched = patchify_latent(ref_latent, self.model_cfg.latent_patch_size).to(
-            self.model_device
-        )
-        if ref_latent_patched.shape[1] == 0:
-            raise ValueError(
-                "Reference latent length became zero after patchify. Use longer reference audio."
-            )
-        if batch_size > 1:
-            ref_latent_patched = ref_latent_patched.repeat(batch_size, 1, 1)
-        ref_mask = torch.ones(
-            (batch_size, ref_latent_patched.shape[1]), dtype=torch.bool, device=self.model_device
-        )
-        return ref_latent_patched, ref_mask
-
     def synthesize(
         self,
         req: SamplingRequest,
@@ -632,7 +393,6 @@ class InferenceRuntime:
             if log_fn is not None:
                 log_fn(msg)
 
-        messages: list[str] = []
         _log(
             (
                 "[runtime] start synthesize "
@@ -652,286 +412,33 @@ class InferenceRuntime:
                 req.decode_mode,
             )
         )
-
-        if req.seconds <= 0:
-            raise ValueError(f"seconds must be > 0, got {req.seconds}")
-        num_candidates = int(req.num_candidates)
-        if num_candidates <= 0:
-            raise ValueError(f"num_candidates must be > 0, got {num_candidates}")
-        decode_mode = str(req.decode_mode).strip().lower()
-        if decode_mode not in {"sequential", "batch"}:
-            raise ValueError(
-                f"Unsupported decode_mode={req.decode_mode!r}. Expected one of: sequential, batch."
-            )
-
-        raw_text = str(req.text)
-        normalized_text = normalize_text(raw_text).strip()
-        if normalized_text == "":
-            raise ValueError("text became empty after normalization.")
-
-        text_max_len = (
-            self.default_text_max_len if req.max_text_len is None else int(req.max_text_len)
-        )
-        if text_max_len <= 0:
-            raise ValueError(f"max_text_len must be > 0, got {text_max_len}")
-        caption_max_len = (
-            self.default_caption_max_len
-            if req.max_caption_len is None
-            else int(req.max_caption_len)
-        )
-        if self.model_cfg.use_caption_condition and caption_max_len <= 0:
-            raise ValueError(f"max_caption_len must be > 0, got {caption_max_len}")
-        has_caption_text = bool(
-            self.model_cfg.use_caption_condition
-            and req.caption is not None
-            and str(req.caption).strip() != ""
-        )
-
-        truncation_factor = None if req.truncation_factor is None else float(req.truncation_factor)
-        rescale_k = None if req.rescale_k is None else float(req.rescale_k)
-        rescale_sigma = None if req.rescale_sigma is None else float(req.rescale_sigma)
-        if truncation_factor is not None and truncation_factor <= 0:
-            raise ValueError(f"truncation_factor must be > 0, got {truncation_factor}")
-        if (rescale_k is None) != (rescale_sigma is None):
-            raise ValueError("rescale_k and rescale_sigma must be set together.")
-        if rescale_k is not None and rescale_k <= 0:
-            raise ValueError(f"rescale_k must be > 0, got {rescale_k}")
-        if rescale_sigma is not None and rescale_sigma <= 0:
-            raise ValueError(f"rescale_sigma must be > 0, got {rescale_sigma}")
-
-        speaker_kv_scale = None if req.speaker_kv_scale is None else float(req.speaker_kv_scale)
-        speaker_kv_min_t = None
-        speaker_kv_max_layers = (
-            None if req.speaker_kv_max_layers is None else int(req.speaker_kv_max_layers)
-        )
-        if speaker_kv_scale is not None:
-            if not self.model_cfg.use_speaker_condition:
-                messages.append(
-                    "info: speaker conditioning is disabled for this checkpoint; ignoring speaker_kv_scale."
-                )
-                speaker_kv_scale = None
-            else:
-                if speaker_kv_scale <= 0:
-                    raise ValueError(f"speaker_kv_scale must be > 0, got {speaker_kv_scale}")
-                speaker_kv_min_t = (
-                    0.9 if req.speaker_kv_min_t is None else float(req.speaker_kv_min_t)
-                )
-                if not (0.0 <= speaker_kv_min_t <= 1.0):
-                    raise ValueError(f"speaker_kv_min_t must be in [0, 1], got {speaker_kv_min_t}")
-                if speaker_kv_max_layers is not None and speaker_kv_max_layers < 0:
-                    raise ValueError(
-                        f"speaker_kv_max_layers must be >= 0 when specified, got {speaker_kv_max_layers}"
-                    )
-
-        cfg_mode = str(req.cfg_guidance_mode).strip().lower()
-        if cfg_mode not in {"independent", "joint", "alternating"}:
-            raise ValueError(
-                f"Unsupported cfg_guidance_mode={req.cfg_guidance_mode!r}. "
-                "Expected one of: independent, joint, alternating."
-            )
-
-        cfg_scale_text, cfg_scale_caption, cfg_scale_speaker, cfg_scale_character, scale_messages = resolve_cfg_scales(
-            cfg_guidance_mode=cfg_mode,
-            cfg_scale_text=req.cfg_scale_text,
-            cfg_scale_caption=req.cfg_scale_caption,
-            cfg_scale_speaker=req.cfg_scale_speaker,
-            cfg_scale_character=req.cfg_scale_character,
-            cfg_scale=req.cfg_scale,
-            use_caption_condition=has_caption_text,
-            use_speaker_condition=self.model_cfg.use_speaker_condition,
-            use_character_condition=self.model_cfg.use_character_condition,
-        )
-        messages.extend(scale_messages)
-        for msg in scale_messages:
-            _log(msg)
-
-        stage_timings: list[tuple[str, float]] = []
-        if req.seed is None:
-            used_seed = int(secrets.randbits(63))
-            msg = f"info: seed not specified; using random seed {used_seed}."
-            messages.append(msg)
-            _log(msg)
-        else:
-            used_seed = int(req.seed)
-            _log(f"[runtime] using seed: {used_seed}")
-        post_load_t0 = _measure_start(self.model_device, self.codec_device)
-
         with self._infer_lock, torch.inference_mode():
-            t0 = _measure_start(self.model_device)
-            text_ids, text_mask = self.tokenizer.batch_encode(
-                [normalized_text] * num_candidates,
-                max_length=text_max_len,
-            )
-            stage_sec = _measure_end(self.model_device, t0)
-            stage_timings.append(("tokenize_text", stage_sec))
-            _log(f"[runtime] tokenize_text: {stage_sec * 1000.0:.1f} ms")
-            text_ids = text_ids.to(self.model_device)
-            text_mask = text_mask.to(self.model_device)
-            caption_ids = None
-            caption_mask = None
-            if self.model_cfg.use_caption_condition:
-                if self.caption_tokenizer is None:
-                    raise RuntimeError(
-                        "Caption conditioning is enabled but caption tokenizer is not loaded."
-                    )
-                caption_text = "" if req.caption is None else str(req.caption).strip()
-                caption_ids, caption_mask = self.caption_tokenizer.batch_encode(
-                    [caption_text] * num_candidates,
-                    max_length=caption_max_len,
-                )
-                if caption_text == "":
-                    caption_mask.zero_()
-                caption_ids = caption_ids.to(self.model_device)
-                caption_mask = caption_mask.to(self.model_device)
-
-            character_images = None
-            if self.model_cfg.use_character_condition:
-                if req.character_image is not None and str(req.character_image).strip():
-                    from pathlib import Path as _Path
-
-                    from .image_encoder import load_character_image
-
-                    if self.character_image_transform is None:
-                        raise RuntimeError(
-                            "Character conditioning is enabled but character image transform is not loaded."
-                        )
-                    img = load_character_image(_Path(req.character_image))
-                    img_tensor = self.character_image_transform(img).unsqueeze(0).to(self.model_device)
-                    character_images = img_tensor.expand(num_candidates, -1, -1, -1)
-                else:
-                    # Unconditional: provide zeros tensor so model gets valid input shape.
-                    character_images = torch.zeros(
-                        num_candidates,
-                        3,
-                        self.model_cfg.character_image_size,
-                        self.model_cfg.character_image_size,
-                        device=self.model_device,
-                    )
-
-            target_samples = int(float(req.seconds) * self.codec.sample_rate)
-            latent_steps = math.ceil(target_samples / int(self.codec.model.hop_length))
-            patched_steps = math.ceil(latent_steps / self.model_cfg.latent_patch_size)
-
+            fixed_target_latent_steps = None
             if isinstance(self.train_cfg, dict):
-                fixed_steps = self.train_cfg.get("fixed_target_latent_steps")
-                if isinstance(fixed_steps, int) and fixed_steps > 0 and latent_steps > fixed_steps:
-                    msg = (
-                        f"warning: requested latent length ({latent_steps}) exceeds fixed_target_latent_steps ({fixed_steps}) "
-                        "used in training. Long-tail stability may degrade."
-                    )
-                    messages.append(msg)
-                    _log(msg)
-
-            t0 = _measure_start(self.model_device, self.codec_device)
-            msg_count_before_ref = len(messages)
-            ref_latent, ref_mask = self._load_reference_latent(
-                req=req,
-                batch_size=num_candidates,
-                messages=messages,
-            )
-            stage_sec = _measure_end(self.model_device, t0, self.codec_device)
-            stage_timings.append(("prepare_reference", stage_sec))
-            for msg in messages[msg_count_before_ref:]:
-                _log(msg)
-            _log(f"[runtime] prepare_reference: {stage_sec * 1000.0:.1f} ms")
-
-            t0 = _measure_start(self.model_device)
-            z_patched = sample_euler_rf_cfg(
+                candidate_steps = self.train_cfg.get("fixed_target_latent_steps")
+                if isinstance(candidate_steps, int):
+                    fixed_target_latent_steps = int(candidate_steps)
+            result = generation_core.generate_from_components(
                 model=self.model,
-                text_input_ids=text_ids,
-                text_mask=text_mask,
-                ref_latent=ref_latent,
-                ref_mask=ref_mask,
-                sequence_length=patched_steps,
-                caption_input_ids=caption_ids,
-                caption_mask=caption_mask,
-                character_images=character_images,
-                num_steps=int(req.num_steps),
-                cfg_scale_text=cfg_scale_text,
-                cfg_scale_caption=cfg_scale_caption,
-                cfg_scale_speaker=cfg_scale_speaker,
-                cfg_scale_character=cfg_scale_character,
-                cfg_guidance_mode=cfg_mode,
-                cfg_min_t=float(req.cfg_min_t),
-                cfg_max_t=float(req.cfg_max_t),
-                seed=used_seed,
-                truncation_factor=truncation_factor,
-                rescale_k=rescale_k,
-                rescale_sigma=rescale_sigma,
-                use_context_kv_cache=bool(req.context_kv_cache),
-                speaker_kv_scale=speaker_kv_scale,
-                speaker_kv_max_layers=speaker_kv_max_layers,
-                speaker_kv_min_t=speaker_kv_min_t,
+                model_cfg=self.model_cfg,
+                tokenizer=self.tokenizer,
+                caption_tokenizer=self.caption_tokenizer,
+                codec=self.codec,
+                request=req,
+                default_text_max_len=self.default_text_max_len,
+                default_caption_max_len=self.default_caption_max_len,
+                character_image_transform=self.character_image_transform,
+                model_device=self.model_device,
+                codec_device=self.codec_device,
+                use_bf16_autocast=False,
+                fixed_target_latent_steps=fixed_target_latent_steps,
+                log_fn=log_fn,
+                measure_start=lambda *devices: _measure_start(*devices),
+                measure_end=lambda t0, *devices: _measure_end(devices[0], t0, *devices[1:]),
             )
-            stage_sec = _measure_end(self.model_device, t0)
-            stage_timings.append(("sample_rf", stage_sec))
-            _log(f"[runtime] sample_rf: {stage_sec * 1000.0:.1f} ms")
-
-            t0 = _measure_start(self.model_device)
-            z = unpatchify_latent(
-                z_patched,
-                patch_size=self.model_cfg.latent_patch_size,
-                latent_dim=self.model_cfg.latent_dim,
-            )
-            stage_sec = _measure_end(self.model_device, t0)
-            stage_timings.append(("unpatchify_latent", stage_sec))
-            _log(f"[runtime] unpatchify_latent: {stage_sec * 1000.0:.1f} ms")
-            z = z[:, :latent_steps]
-
-            t0 = _measure_start(self.model_device, self.codec_device)
-            trimmed_audios: list[torch.Tensor] = []
-            if decode_mode == "batch":
-                audio_batch = self.codec.decode_latent(z).cpu()
-                for i in range(num_candidates):
-                    audio_i = audio_batch[i]
-                    max_samples = target_samples
-                    if bool(req.trim_tail):
-                        flattening_point = find_flattening_point(
-                            z[i],
-                            window_size=max(1, int(req.tail_window_size)),
-                            std_threshold=float(req.tail_std_threshold),
-                            mean_threshold=float(req.tail_mean_threshold),
-                        )
-                        flattening_samples = int(
-                            flattening_point * int(self.codec.model.hop_length)
-                        )
-                        if flattening_samples > 0:
-                            max_samples = min(max_samples, flattening_samples)
-                    trimmed_audios.append(audio_i[:, :max_samples])
-            else:
-                for i in range(num_candidates):
-                    audio_i = self.codec.decode_latent(z[i : i + 1]).cpu()[0]
-                    max_samples = target_samples
-                    if bool(req.trim_tail):
-                        flattening_point = find_flattening_point(
-                            z[i],
-                            window_size=max(1, int(req.tail_window_size)),
-                            std_threshold=float(req.tail_std_threshold),
-                            mean_threshold=float(req.tail_mean_threshold),
-                        )
-                        flattening_samples = int(
-                            flattening_point * int(self.codec.model.hop_length)
-                        )
-                        if flattening_samples > 0:
-                            max_samples = min(max_samples, flattening_samples)
-                    trimmed_audios.append(audio_i[:, :max_samples])
-            stage_sec = _measure_end(self.model_device, t0, self.codec_device)
-            stage_timings.append(("decode_latent", stage_sec))
-            _log(f"[runtime] decode_latent ({decode_mode}): {stage_sec * 1000.0:.1f} ms")
-
-            total_to_decode = _measure_end(self.model_device, post_load_t0, self.codec_device)
-            _log(f"[runtime] total_to_decode: {total_to_decode:.3f} s")
 
         _log("[runtime] done synthesize")
-        return SamplingResult(
-            audio=trimmed_audios[0],
-            audios=trimmed_audios,
-            sample_rate=int(self.codec.sample_rate),
-            stage_timings=stage_timings,
-            total_to_decode=total_to_decode,
-            used_seed=used_seed,
-            messages=messages,
-        )
+        return result
 
     def unload(self) -> None:
         del self.model
@@ -981,18 +488,7 @@ def clear_cached_runtime() -> None:
 
 
 def _load_audio(path: str | Path) -> tuple[torch.Tensor, int]:
-    try:
-        return torchaudio.load(str(path))
-    except RuntimeError:
-        import soundfile as sf
-
-        data, sr = sf.read(str(path), dtype="float32")
-        wav = torch.from_numpy(data)
-        if wav.ndim == 1:
-            wav = wav.unsqueeze(0)
-        else:
-            wav = wav.T
-        return wav, sr
+    return generation_core.load_audio(path)
 
 
 def save_wav(path: str | Path, audio: torch.Tensor, sample_rate: int) -> Path:

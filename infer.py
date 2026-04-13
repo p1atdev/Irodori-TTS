@@ -12,7 +12,6 @@ from irodori_tts.inference_runtime import (
     RuntimeKey,
     SamplingRequest,
     default_runtime_device,
-    resolve_cfg_scales,
     save_wav,
 )
 
@@ -345,21 +344,6 @@ def main() -> None:
         parser.error(
             "speaker-conditioned checkpoints require one of --ref-wav, --ref-latent, or --no-ref."
         )
-    cfg_scale_text, cfg_scale_caption, cfg_scale_speaker, scale_messages = resolve_cfg_scales(
-        cfg_guidance_mode=str(args.cfg_guidance_mode),
-        cfg_scale_text=float(args.cfg_scale_text),
-        cfg_scale_caption=float(args.cfg_scale_caption),
-        cfg_scale_speaker=float(args.cfg_scale_speaker),
-        cfg_scale=float(args.cfg_scale) if args.cfg_scale is not None else None,
-        use_caption_condition=bool(
-            runtime.model_cfg.use_caption_condition
-            and args.caption is not None
-            and str(args.caption).strip() != ""
-        ),
-        use_speaker_condition=bool(runtime.model_cfg.use_speaker_condition),
-    )
-    for msg in scale_messages:
-        print(msg)
 
     result = runtime.synthesize(
         SamplingRequest(
@@ -379,11 +363,11 @@ def main() -> None:
             max_text_len=None if args.max_text_len is None else int(args.max_text_len),
             max_caption_len=None if args.max_caption_len is None else int(args.max_caption_len),
             num_steps=int(args.num_steps),
-            cfg_scale_text=cfg_scale_text,
-            cfg_scale_caption=cfg_scale_caption,
-            cfg_scale_speaker=cfg_scale_speaker,
+            cfg_scale_text=float(args.cfg_scale_text),
+            cfg_scale_caption=float(args.cfg_scale_caption),
+            cfg_scale_speaker=float(args.cfg_scale_speaker),
             cfg_guidance_mode=str(args.cfg_guidance_mode),
-            cfg_scale=None,
+            cfg_scale=float(args.cfg_scale) if args.cfg_scale is not None else None,
             cfg_min_t=float(args.cfg_min_t),
             cfg_max_t=float(args.cfg_max_t),
             truncation_factor=None
@@ -409,6 +393,8 @@ def main() -> None:
         ),
         log_fn=None,
     )
+    for msg in result.messages:
+        print(msg)
 
     print(f"[seed] used_seed: {result.used_seed}")
     if int(args.num_candidates) == 1:
