@@ -8,6 +8,7 @@ import random
 import re
 import shutil
 import sys
+import warnings
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, replace
@@ -719,6 +720,54 @@ def is_character_only_parameter(key: str) -> bool:
     )
 
 
+def initialize_character_attention_from_checkpoint(
+    model: TextToLatentRFDiT,
+    checkpoint_state: dict[str, torch.Tensor],
+) -> tuple[int, int, dict[str, int]]:
+    """Warm-start wk_character/wv_character by reading from the checkpoint state_dict.
+
+    Source priority per block: caption > speaker > text. The first branch whose
+    wk/wv weights are present in ``checkpoint_state`` and whose shapes match the
+    character branch is used. Because the in-memory model disables caption /
+    speaker branches when character conditioning is enabled, sources are looked
+    up directly in the raw checkpoint tensors instead of attributes on the model.
+
+    Returns (copied_block_count, skipped_block_count, source_counts), where
+    source_counts maps branch name ("caption"/"speaker"/"text") to the number
+    of blocks initialized from that branch.
+    """
+    copied = 0
+    skipped = 0
+    source_counts: dict[str, int] = {"caption": 0, "speaker": 0, "text": 0}
+    priority = ("caption", "speaker", "text")
+    for block_index, block in enumerate(model.blocks):
+        attention = block.attention
+        if not getattr(attention, "has_character_condition", False):
+            continue
+        dst_k = attention.wk_character
+        dst_v = attention.wv_character
+        prefix = f"blocks.{block_index}.attention"
+        chosen: str | None = None
+        for name in priority:
+            src_k = checkpoint_state.get(f"{prefix}.wk_{name}.weight")
+            src_v = checkpoint_state.get(f"{prefix}.wv_{name}.weight")
+            if src_k is None or src_v is None:
+                continue
+            if src_k.shape != dst_k.weight.shape or src_v.shape != dst_v.weight.shape:
+                continue
+            with torch.no_grad():
+                dst_k.weight.copy_(src_k.to(dst_k.weight.device, dtype=dst_k.weight.dtype))
+                dst_v.weight.copy_(src_v.to(dst_v.weight.device, dtype=dst_v.weight.dtype))
+            chosen = name
+            break
+        if chosen is None:
+            skipped += 1
+            continue
+        source_counts[chosen] += 1
+        copied += 1
+    return copied, skipped, source_counts
+
+
 def clear_non_caption_grads(model: TextToLatentRFDiT) -> tuple[int, int]:
     caption_grad_params = 0
     cleared_grad_params = 0
@@ -941,6 +990,7 @@ def _apply_base_initialization(
         missing_keys: list[str] = []
         initialized_caption_embedding = False
         resolved_character_branch = False
+        resolved_character_copy: tuple[int, int, dict[str, int]] | None = None
         if (current_has_caption and not checkpoint_has_caption) or (
             current_has_character and not checkpoint_has_character
         ):
@@ -989,7 +1039,20 @@ def _apply_base_initialization(
                     )
                 initialized_caption_embedding = True
             if current_has_character and not checkpoint_has_character:
+                copied_blocks, skipped_blocks, source_counts = (
+                    initialize_character_attention_from_checkpoint(raw_model, init_state)
+                )
                 resolved_character_branch = True
+                resolved_character_copy = (copied_blocks, skipped_blocks, source_counts)
+                if skipped_blocks > 0 and is_main_process:
+                    warnings.warn(
+                        "Character attention weights could not be warm-started from "
+                        f"caption/speaker/text branches for {skipped_blocks} block(s) "
+                        "due to shape mismatch; those blocks retain default "
+                        "initialization. Consider aligning character_dim with one of "
+                        "caption_dim/speaker_dim/text_dim to enable warm-start copy.",
+                        stacklevel=2,
+                    )
         else:
             raw_model.load_state_dict(init_state, strict=True)
 
@@ -1000,9 +1063,21 @@ def _apply_base_initialization(
             if initialized_caption_embedding:
                 print("Caption embedding was initialized from its pretrained tokenizer backbone.")
             if resolved_character_branch:
+                copied_blocks, skipped_blocks, source_counts = resolved_character_copy or (
+                    0,
+                    0,
+                    {"caption": 0, "speaker": 0, "text": 0},
+                )
+                sources_summary = ", ".join(
+                    f"{name}={source_counts.get(name, 0)}"
+                    for name in ("caption", "speaker", "text")
+                )
                 print(
-                    "Character conditioning weights were kept from the current model initialization "
-                    "(pretrained timm backbone + freshly initialized projector/attention weights)."
+                    "Character attention weights (wk_character/wv_character) warm-started "
+                    f"for {copied_blocks} block(s) [{sources_summary}]; "
+                    f"{skipped_blocks} block(s) skipped due to shape mismatch. "
+                    "character_encoder (pretrained timm backbone + freshly initialized "
+                    "projector) is kept from the current model initialization."
                 )
         return
 

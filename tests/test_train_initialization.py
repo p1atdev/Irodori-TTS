@@ -2,6 +2,7 @@ from __future__ import annotations
 
 # ruff: noqa: E402
 import sys
+import warnings
 from dataclasses import asdict
 from pathlib import Path
 
@@ -129,7 +130,6 @@ def test_apply_base_initialization_allows_character_upgrade(monkeypatch, tmp_pat
     char_cfg = make_character_config()
     char_model = TextToLatentRFDiT(char_cfg)
     character_proj_before = char_model.character_encoder.proj.blocks[0].fc1.weight.detach().clone()
-    character_attn_before = char_model.blocks[0].attention.wk_character.weight.detach().clone()
 
     train._apply_base_initialization(
         char_model,
@@ -145,7 +145,117 @@ def test_apply_base_initialization_allows_character_upgrade(monkeypatch, tmp_pat
         char_model.character_encoder.proj.blocks[0].fc1.weight,
         character_proj_before,
     )
-    assert torch.allclose(
-        char_model.blocks[0].attention.wk_character.weight,
-        character_attn_before,
+    # base_cfg has speaker condition enabled (no caption/character), so the
+    # warm-start priority (caption > speaker > text) picks speaker weights.
+    for i, block in enumerate(char_model.blocks):
+        expected_wk = base_model.blocks[i].attention.wk_speaker.weight
+        expected_wv = base_model.blocks[i].attention.wv_speaker.weight
+        assert torch.equal(block.attention.wk_character.weight, expected_wk)
+        assert torch.equal(block.attention.wv_character.weight, expected_wv)
+
+
+def test_apply_base_initialization_skips_character_copy_on_shape_mismatch(
+    monkeypatch, tmp_path: Path
+) -> None:
+    patch_character_backbone(monkeypatch)
+
+    base_cfg = make_base_config()
+    base_model = TextToLatentRFDiT(base_cfg)
+
+    checkpoint_path = tmp_path / "base_checkpoint.pt"
+    torch.save(
+        {
+            "model": base_model.state_dict(),
+            "model_config": asdict(base_cfg),
+        },
+        checkpoint_path,
     )
+
+    char_cfg = make_character_config()
+    # Make character_dim differ from text_dim so the copy path should skip.
+    char_cfg.character_dim = base_cfg.text_dim * 2
+    char_model = TextToLatentRFDiT(char_cfg)
+    character_attn_before = [
+        block.attention.wk_character.weight.detach().clone() for block in char_model.blocks
+    ]
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        train._apply_base_initialization(
+            char_model,
+            model_cfg=char_cfg,
+            base_init={"mode": "checkpoint", "checkpoint_path": str(checkpoint_path)},
+            distributed=False,
+            is_main_process=True,
+        )
+
+    assert any("shape mismatch" in str(w.message) for w in caught)
+    for block, before in zip(char_model.blocks, character_attn_before, strict=True):
+        assert torch.equal(block.attention.wk_character.weight, before)
+
+
+def _fake_source_state(num_blocks: int, prefix: str, dim: int, in_dim: int) -> dict:
+    state: dict[str, torch.Tensor] = {}
+    for i in range(num_blocks):
+        state[f"blocks.{i}.attention.wk_{prefix}.weight"] = torch.randn(dim, in_dim)
+        state[f"blocks.{i}.attention.wv_{prefix}.weight"] = torch.randn(dim, in_dim)
+    return state
+
+
+def test_initialize_character_attention_prefers_caption(monkeypatch) -> None:
+    patch_character_backbone(monkeypatch)
+
+    char_cfg = make_character_config()
+    char_model = TextToLatentRFDiT(char_cfg)
+    dim = char_model.blocks[0].attention.wk_character.weight.shape[0]
+    in_dim = char_model.blocks[0].attention.wk_character.weight.shape[1]
+
+    state = _fake_source_state(len(char_model.blocks), "caption", dim, in_dim)
+    # Also provide text weights; caption should win over them.
+    state.update(_fake_source_state(len(char_model.blocks), "text", dim, in_dim))
+
+    copied, skipped, sources = train.initialize_character_attention_from_checkpoint(
+        char_model, state
+    )
+
+    assert copied == len(char_model.blocks)
+    assert skipped == 0
+    assert sources == {"caption": len(char_model.blocks), "speaker": 0, "text": 0}
+    for i, block in enumerate(char_model.blocks):
+        assert torch.equal(
+            block.attention.wk_character.weight,
+            state[f"blocks.{i}.attention.wk_caption.weight"],
+        )
+        assert torch.equal(
+            block.attention.wv_character.weight,
+            state[f"blocks.{i}.attention.wv_caption.weight"],
+        )
+
+
+def test_initialize_character_attention_prefers_speaker_over_text(monkeypatch) -> None:
+    patch_character_backbone(monkeypatch)
+
+    char_cfg = make_character_config()
+    char_model = TextToLatentRFDiT(char_cfg)
+    dim = char_model.blocks[0].attention.wk_character.weight.shape[0]
+    in_dim = char_model.blocks[0].attention.wk_character.weight.shape[1]
+
+    state = _fake_source_state(len(char_model.blocks), "speaker", dim, in_dim)
+    state.update(_fake_source_state(len(char_model.blocks), "text", dim, in_dim))
+
+    copied, skipped, sources = train.initialize_character_attention_from_checkpoint(
+        char_model, state
+    )
+
+    assert copied == len(char_model.blocks)
+    assert skipped == 0
+    assert sources == {"caption": 0, "speaker": len(char_model.blocks), "text": 0}
+    for i, block in enumerate(char_model.blocks):
+        assert torch.equal(
+            block.attention.wk_character.weight,
+            state[f"blocks.{i}.attention.wk_speaker.weight"],
+        )
+        assert torch.equal(
+            block.attention.wv_character.weight,
+            state[f"blocks.{i}.attention.wv_speaker.weight"],
+        )
