@@ -213,8 +213,14 @@ class JointAttention(nn.Module):
         caption_ctx_dim: int | None,
         character_ctx_dim: int | None,
         norm_eps: float,
+        character_attention_mode: str = "joint",
     ):
         super().__init__()
+        if character_attention_mode not in ("joint", "cross"):
+            raise ValueError(
+                f"character_attention_mode must be 'joint' or 'cross', got {character_attention_mode!r}"
+            )
+        self.character_attention_mode = character_attention_mode
         if dim % heads != 0:
             raise ValueError(f"dim={dim} must be divisible by heads={heads}")
         if (dim // heads) % 2 != 0:
@@ -460,9 +466,10 @@ class JointAttention(nn.Module):
                     "Character projections are missing despite enabled character conditioning."
                 )
 
-            context_k.append(k_character)
-            context_v.append(v_character)
-            context_masks.append(character_mask)
+            if self.character_attention_mode == "joint":
+                context_k.append(k_character)
+                context_v.append(v_character)
+                context_masks.append(character_mask)
 
         k = torch.cat(context_k, dim=1)
         v = torch.cat(context_v, dim=1)
@@ -475,7 +482,22 @@ class JointAttention(nn.Module):
             v.transpose(1, 2),
             attn_mask=attn_mask,
             is_causal=False,
-        ).transpose(1, 2)
+        )
+
+        if self.has_character_condition and self.character_attention_mode == "cross":
+            assert k_character is not None and v_character is not None
+            assert character_mask is not None
+            y_char = F.scaled_dot_product_attention(
+                q.transpose(1, 2),
+                k_character.transpose(1, 2),
+                v_character.transpose(1, 2),
+                attn_mask=character_mask[:, None, None, :],
+                is_causal=False,
+            )
+            # TODO: character attention scale
+            y = y + y_char * 1.0
+
+        y = y.transpose(1, 2)
         y = y.reshape(bsz, seq_len, self.dim)
         y = y * torch.sigmoid(self.gate(x))
 
@@ -613,6 +635,7 @@ class DiffusionBlock(nn.Module):
             cfg.caption_dim_resolved if cfg.use_caption_condition else None,
             character_ctx_dim=cfg.character_dim_resolved if cfg.use_character_condition else None,
             norm_eps=cfg.norm_eps,
+            character_attention_mode=cfg.character_attention_mode,
         )
         self.mlp = SwiGLU(cfg.model_dim, int(cfg.model_dim * cfg.mlp_ratio))
         adaln_rank = max(1, min(int(cfg.adaln_rank), int(cfg.model_dim)))
@@ -666,6 +689,18 @@ class DiffusionBlock(nn.Module):
         h, mlp_gate = self.mlp_adaln(x, cond_embed)
         x = x + self.dropout(mlp_gate * self.mlp(h))
         return x
+
+
+class EncodedConditions(NamedTuple):
+    text_state: torch.Tensor
+    text_mask: torch.Tensor
+    speaker_state: torch.Tensor | None
+    speaker_mask: torch.Tensor | None
+    caption_state: torch.Tensor | None
+    caption_mask: torch.Tensor | None
+    character_state: torch.Tensor | None
+    character_mask: torch.Tensor | None
+    character_noisy_state: torch.Tensor | None
 
 
 class TextToLatentRFDiT(nn.Module):
@@ -792,16 +827,8 @@ class TextToLatentRFDiT(nn.Module):
         speaker_condition_dropout: torch.Tensor | None = None,
         caption_condition_dropout: torch.Tensor | None = None,
         character_condition_dropout: torch.Tensor | None = None,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor | None,
-        torch.Tensor | None,
-        torch.Tensor | None,
-        torch.Tensor | None,
-        torch.Tensor | None,
-        torch.Tensor | None,
-    ]:
+        use_character_noisy_condition: bool = False,
+    ) -> EncodedConditions:
         if text_condition_dropout is not None:
             text_mask = text_mask.clone()
             text_mask[text_condition_dropout] = False
@@ -852,6 +879,7 @@ class TextToLatentRFDiT(nn.Module):
             caption_state = self.caption_norm(caption_state)
 
         character_state = None
+        character_noisy_state = None
         if self.cfg.use_character_condition:
             if self.character_encoder is None:
                 raise RuntimeError(
@@ -871,10 +899,15 @@ class TextToLatentRFDiT(nn.Module):
             character_state = self.character_encoder(character_images)
             if character_mask is None:
                 character_mask = torch.ones(
-                    character_state.shape[:2], dtype=torch.bool, device=character_state.device
+                    character_state.shape[:2],
+                    dtype=torch.bool,
+                    device=character_state.device,
                 )
+            character_noisy_state = None
+            if use_character_noisy_condition:
+                character_noisy_state = self.character_encoder(torch.randn_like(character_images))
 
-        return (
+        return EncodedConditions(
             text_state,
             text_mask,
             speaker_state,
@@ -883,6 +916,7 @@ class TextToLatentRFDiT(nn.Module):
             caption_mask,
             character_state,
             character_mask,
+            character_noisy_state,
         )
 
     def forward_with_encoded_conditions(
@@ -907,9 +941,7 @@ class TextToLatentRFDiT(nn.Module):
 
         x = self.in_proj(x_t)
         freqs = self._rope_freqs(x.shape[1], x.device)
-        use_checkpoint = (
-            self.gradient_checkpointing and self.training and context_kv_cache is None
-        )
+        use_checkpoint = self.gradient_checkpointing and self.training and context_kv_cache is None
         for i, block in enumerate(self.blocks):
             context_kv = context_kv_cache[i] if context_kv_cache is not None else None
             if use_checkpoint:
@@ -984,6 +1016,7 @@ class TextToLatentRFDiT(nn.Module):
             caption_mask,
             character_state,
             character_mask,
+            _character_noisy_state,
         ) = self.encode_conditions(
             text_input_ids=text_input_ids,
             text_mask=text_mask,
@@ -998,6 +1031,7 @@ class TextToLatentRFDiT(nn.Module):
             caption_condition_dropout=caption_condition_dropout,
             character_condition_dropout=character_condition_dropout,
         )
+
         return self.forward_with_encoded_conditions(
             x_t=x_t,
             t=t,

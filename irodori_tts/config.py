@@ -52,6 +52,7 @@ class ModelConfig:
     character_use_all_patches: bool = True
     character_image_size: int = 448
     character_projector: dict | None = None
+    character_attention_mode: str = "joint"
     speaker_dim: int = 1280
     speaker_layers: int = 14
     speaker_heads: int = 10

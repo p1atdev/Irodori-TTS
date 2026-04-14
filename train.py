@@ -2432,6 +2432,7 @@ def main() -> None:
         # When combined with LoRA, LoRA adapter params are also unfrozen below.
         unfrozen_count = 0
         total_count = 0
+        matched_names: list[str] = []
         for name, p in raw_model.named_parameters():
             total_count += 1
             if any(
@@ -2440,6 +2441,7 @@ def main() -> None:
             ):
                 p.requires_grad_(True)
                 unfrozen_count += 1
+                matched_names.append(name)
             elif train_config_uses_lora(train_cfg) and "lora_" in name:
                 # Always keep LoRA adapter parameters trainable.
                 p.requires_grad_(True)
@@ -2449,6 +2451,9 @@ def main() -> None:
                 f"trainable_modules={train_cfg.trainable_modules!r}: "
                 f"{unfrozen_count:,}/{total_count:,} parameters trainable."
             )
+            print("matched trainable parameters:")
+            for name in matched_names:
+                print(f"  {name}")
 
     if train_cfg.gradient_checkpointing:
         raw_model.set_gradient_checkpointing(True)

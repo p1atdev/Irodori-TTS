@@ -198,6 +198,7 @@ def sample_euler_rf_cfg(
         caption_mask_cond,
         character_state_cond,
         character_mask_cond,
+        character_noisy_state_cond,
     ) = model.encode_conditions(
         text_input_ids=text_input_ids,
         text_mask=text_mask,
@@ -207,6 +208,7 @@ def sample_euler_rf_cfg(
         caption_mask=caption_mask,
         character_images=character_images,
         character_mask=character_mask,
+        use_character_noisy_condition=True,
     )
     text_state_uncond = torch.zeros_like(text_state_cond)
     text_mask_uncond = torch.zeros_like(text_mask_cond)
@@ -231,15 +233,15 @@ def sample_euler_rf_cfg(
         caption_state_uncond = torch.zeros_like(caption_state_cond)
         caption_mask_uncond = torch.zeros_like(caption_mask_cond)
 
-    character_state_uncond = None
+    character_state_uncond = character_noisy_state_cond
     character_mask_uncond = None
     if model.cfg.use_character_condition:
         if character_state_cond is None or character_mask_cond is None:
             raise RuntimeError(
                 "Character conditioning is enabled but encoded character state is missing."
             )
-        character_state_uncond = torch.zeros_like(character_state_cond)
-        character_mask_uncond = torch.zeros_like(character_mask_cond)
+        # enable attention to negative uncond
+        character_mask_uncond = torch.ones_like(character_mask_cond)
 
     has_text_cfg = cfg_scale_text > 0
     has_caption_cfg = (
@@ -358,8 +360,12 @@ def sample_euler_rf_cfg(
     independent_speaker_mask = _cat_optional_tensors([bundle[3] for bundle in independent_bundles])
     independent_caption_state = _cat_optional_tensors([bundle[4] for bundle in independent_bundles])
     independent_caption_mask = _cat_optional_tensors([bundle[5] for bundle in independent_bundles])
-    independent_character_state = _cat_optional_tensors([bundle[6] for bundle in independent_bundles])
-    independent_character_mask = _cat_optional_tensors([bundle[7] for bundle in independent_bundles])
+    independent_character_state = _cat_optional_tensors(
+        [bundle[6] for bundle in independent_bundles]
+    )
+    independent_character_mask = _cat_optional_tensors(
+        [bundle[7] for bundle in independent_bundles]
+    )
 
     joint_uncond_bundle = _bundle(
         text_state=text_state_uncond,
