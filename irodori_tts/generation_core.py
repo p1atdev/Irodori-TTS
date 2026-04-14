@@ -573,6 +573,8 @@ def generate_from_components(
             character_image_transform=character_image_transform,
             model_device=model_device,
         )
+        if character_images is not None:
+            character_images = character_images.to(dtype=next(model.parameters()).dtype)
 
         target_samples, latent_steps, patched_steps = resolve_sequence_lengths(
             seconds=float(request.seconds),
