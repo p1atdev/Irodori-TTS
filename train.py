@@ -1239,6 +1239,7 @@ class PreviewSampleConfig:
     speaker_kv_max_layers: int | None = None
     speaker_kv_min_t: float | None = None
     seed: int = 0
+    trim_trail: bool = True
 
 
 def parse_preview_samples(preview_samples: list | None) -> list[PreviewSampleConfig]:
@@ -1340,7 +1341,7 @@ def preview_sample_to_sampling_request(cfg: PreviewSampleConfig) -> tuple[Sampli
             speaker_kv_min_t=cfg.speaker_kv_min_t,
             speaker_kv_max_layers=cfg.speaker_kv_max_layers,
             seed=int(cfg.seed),
-            trim_tail=False,
+            trim_tail=cfg.trim_trail,
         ),
         normalized_text,
     )
