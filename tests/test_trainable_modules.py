@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 # ruff: noqa: E402
 import sys
 from pathlib import Path

@@ -3,15 +3,7 @@ from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, TypeVar
 
-
-@dataclass
-class CharacterProjectorConfig:
-    """Configuration for the character image projector module."""
-
-    type: str = "mlp"
-    hidden_dim: int | None = None
-    # Number of MLP blocks. One block is: Linear -> SiLU -> Linear.
-    num_layers: int = 1
+from .projector import ProjectorConfig, resolve_projector_config
 
 
 @dataclass(frozen=True)
@@ -51,6 +43,7 @@ class ModelConfig:
     character_dim: int | None = None
     character_use_all_patches: bool = True
     character_image_size: int = 448
+    character_hidden_state_index: int | None = None
     character_projector: dict | None = None
     character_attention_mode: str = "joint"
     speaker_dim: int = 1280
@@ -130,10 +123,8 @@ class ModelConfig:
         return int(self.character_dim)
 
     @property
-    def character_projector_resolved(self) -> CharacterProjectorConfig:
-        if self.character_projector is None:
-            return CharacterProjectorConfig()
-        return CharacterProjectorConfig(**self.character_projector)
+    def character_projector_resolved(self) -> ProjectorConfig:
+        return resolve_projector_config(self.character_projector)
 
     @property
     def speaker_mlp_ratio_resolved(self) -> float:

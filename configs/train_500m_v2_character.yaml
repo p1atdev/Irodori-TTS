@@ -13,14 +13,22 @@ model:
   text_heads: 8
   # Character reference conditioning (disables speaker conditioning)
   use_character_condition: true
-  character_encoder_model: hf_hub:SmilingWolf/wd-swinv2-tagger-v3
-  character_dim: 512
+  # character_encoder_model: hf_hub:SmilingWolf/wd-swinv2-tagger-v3
+  character_encoder_model: hf_hub:SmilingWolf/wd-vit-tagger-v3
+  character_hidden_state_index: -3
+  character_dim: 768
   character_use_all_patches: true
   character_image_size: 448
+  character_attention_mode: cross  # joint or cross
   character_projector:
-    type: mlp
-    hidden_dim: 1280
-    num_layers: 1
+    # type: mlp
+    # hidden_dim: 2048
+    # num_layers: 1
+    type: resampler
+    num_heads: 8
+    depth: 4
+    num_query_tokens: 16
+    mlp_ratio: 2.0
   # Speaker encoder kept for architecture consistency but disabled via use_speaker_condition
   speaker_mlp_ratio: 2.6
   speaker_dim: 768
@@ -50,7 +58,7 @@ train:
   # optimizer / learning rate
   optimizer: radam_schedule_free
   # muon_momentum: 0.95
-  learning_rate: 0.01
+  learning_rate: 0.001
   weight_decay: 0.01
   lr_scheduler: none # none, cosine, wsd
   # warmup_steps: 1000
@@ -60,14 +68,14 @@ train:
   adam_beta2: 0.99
   # adam_eps: 0.00000001
   # 
-  max_steps: 5000
+  max_steps: 50000
   #
-  max_text_len: 64
-  text_condition_dropout: 0.1
-  character_condition_dropout: 0.1
+  max_text_len: 32
+  text_condition_dropout: 0.0
+  character_condition_dropout: 0.0
   character_unconditional_fill: zero  # zero, randn, rand
   # 
-  timestep_stratified: true
+  timestep_stratified: true # true/false
   max_latent_steps: 750
   fixed_target_latent_steps: 750
   fixed_target_full_mask: true
@@ -76,7 +84,7 @@ train:
   save_every: 100
   checkpoint_best_n: 5
   # 
-  wandb_enabled: false
+  wandb_enabled: true
   wandb_project: irodori-tts-character
   # wandb_entity:
   # wandb_run_name:
@@ -90,30 +98,34 @@ train:
   # Preview generation during training (requires wandb_enabled: true to log audio)
   preview_every: 100
   preview_samples:
-    - text: ディープラーニングは、画像認識や自然言語処理など、今や私たちの生活のいたる場所で活用されています。昨日まで不可能だと思われていたことが次々と実現していく様子を目の当たりにすると、未来への無限の可能性を感じてワクワクしますね
+    - text: おはようございます！今日も一日頑張りましょう！
       image_path: data/sample/sample-01.webp
       num_steps: 20
+      seconds: 10.0
       cfg_guidance_mode: independent # joint, alternating
       cfg_scale_text: 3.0
       cfg_scale_character: 5.0
       seed: 0
-    - text: ディープラーニングは、画像認識や自然言語処理など、今や私たちの生活のいたる場所で活用されています。昨日まで不可能だと思われていたことが次々と実現していく様子を目の当たりにすると、未来への無限の可能性を感じてワクワクしますね
+    - text: おはようございます！今日も一日頑張りましょう！
       image_path: data/sample/sample-02.webp
       num_steps: 20
+      seconds: 10.0
       cfg_guidance_mode: independent
       cfg_scale_text: 3.0
       cfg_scale_character: 3.0
       seed: 0
-    - text: ディープラーニングは、画像認識や自然言語処理など、今や私たちの生活のいたる場所で活用されています。昨日まで不可能だと思われていたことが次々と実現していく様子を目の当たりにすると、未来への無限の可能性を感じてワクワクしますね
+    - text: おはようございます！今日も一日頑張りましょう！
       image_path: data/sample/sample-05.webp
       num_steps: 20
+      seconds: 10.0
       cfg_guidance_mode: independent
       cfg_scale_text: 3.0
       cfg_scale_character: 3.0
       seed: 0
-    - text: ディープラーニングは、画像認識や自然言語処理など、今や私たちの生活のいたる場所で活用されています。昨日まで不可能だと思われていたことが次々と実現していく様子を目の当たりにすると、未来への無限の可能性を感じてワクワクしますね
+    - text: おはようございます！今日も一日頑張りましょう！
       image_path: data/sample/sample-06.webp
       num_steps: 20
+      seconds: 10.0
       cfg_guidance_mode: independent
       cfg_scale_text: 3.0
       cfg_scale_character: 3.0

@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from dataclasses import asdict
 from typing import NamedTuple
 
@@ -758,6 +756,7 @@ class TextToLatentRFDiT(nn.Module):
                 use_all_patches=cfg.character_use_all_patches,
                 image_size=cfg.character_image_size,
                 projector_config=cfg.character_projector_resolved,
+                hidden_state_index=cfg.character_hidden_state_index,
             )
 
         # timestep embedder

@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from collections.abc import Callable
 from os import PathLike
 
@@ -9,7 +7,7 @@ from PIL import Image as PILImage
 from timm import create_model
 from timm import data as timm_data
 
-from .config import CharacterProjectorConfig
+from .projector import ProjectorConfig, build_projector, resolve_projector_config
 
 
 def load_character_image(
@@ -25,14 +23,6 @@ def load_character_image(
         canvas.paste(img, mask=img.split()[-1])
         return canvas
     return img.convert("RGB")
-
-_PROJECTOR_LINEAR_INIT_STD = 0.02
-
-
-def _init_projector_linear(module: nn.Linear) -> None:
-    nn.init.normal_(module.weight, mean=0.0, std=_PROJECTOR_LINEAR_INIT_STD)
-    if module.bias is not None:
-        nn.init.zeros_(module.bias)
 
 
 class _RMSNorm(nn.Module):
@@ -52,74 +42,6 @@ class _RMSNorm(nn.Module):
         x = x.float()
         rms = x.pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
         return (x * rms * self.weight).to(x_dtype)
-
-
-class _MLPBlock(nn.Module):
-    """A single MLP block: Linear -> SiLU -> Linear."""
-
-    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int):
-        super().__init__()
-        self.fc1 = nn.Linear(in_dim, hidden_dim, bias=False)
-        self.act = nn.SiLU()
-        self.fc2 = nn.Linear(hidden_dim, out_dim, bias=False)
-        self.reset_parameters()
-
-    def reset_parameters(self) -> None:
-        _init_projector_linear(self.fc1)
-        _init_projector_linear(self.fc2)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.fc2(self.act(self.fc1(x)))
-
-
-class MLPProjector(nn.Module):
-    """Projector made of stacked MLP blocks.
-
-    Notes:
-        ``num_layers`` counts MLP blocks, not Linear layers.
-        Each block is ``Linear -> SiLU -> Linear``.
-        So ``num_layers=1`` means a standard single MLP block.
-    """
-
-    def __init__(
-        self,
-        in_dim: int,
-        hidden_dim: int,
-        out_dim: int,
-        num_layers: int = 1,
-    ):
-        super().__init__()
-        if num_layers < 1:
-            raise ValueError(f"num_layers must be >= 1, got {num_layers}")
-
-        blocks: list[nn.Module] = []
-        block_in_dim = in_dim
-        for layer_idx in range(num_layers):
-            block_out_dim = out_dim if layer_idx == num_layers - 1 else hidden_dim
-            blocks.append(_MLPBlock(block_in_dim, hidden_dim, block_out_dim))
-            block_in_dim = block_out_dim
-        self.blocks = nn.Sequential(*blocks)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.blocks(x)
-
-
-def build_projector(
-    config: CharacterProjectorConfig,
-    backbone_dim: int,
-    output_dim: int,
-) -> nn.Module:
-    """Factory for building a projector module from config."""
-    hidden_dim = config.hidden_dim if config.hidden_dim is not None else backbone_dim
-
-    if config.type == "mlp":
-        return MLPProjector(
-            in_dim=backbone_dim,
-            hidden_dim=hidden_dim,
-            out_dim=output_dim,
-            num_layers=config.num_layers,
-        )
-    raise ValueError(f"Unknown projector type: {config.type!r}")
 
 
 def build_character_transform(timm_model_id: str, image_size: int) -> Callable:
@@ -162,12 +84,13 @@ class CharacterImageEncoder(nn.Module):
         use_all_patches: bool = True,
         image_size: int = 448,
         pretrained: bool = True,
-        projector_config: CharacterProjectorConfig | None = None,
+        projector_config: ProjectorConfig | dict | None = None,
+        hidden_state_index: int | None = None,
     ):
         super().__init__()
 
-        if projector_config is None:
-            projector_config = CharacterProjectorConfig()
+        if projector_config is None or isinstance(projector_config, dict):
+            projector_config = resolve_projector_config(projector_config)
 
         # Load backbone without classification head, retaining all spatial tokens.
         backbone = create_model(
@@ -183,11 +106,18 @@ class CharacterImageEncoder(nn.Module):
         self.backbone = backbone
         self.use_all_patches = use_all_patches
         self._image_size = image_size
+        self._hidden_state_index = hidden_state_index
+
+        if hidden_state_index is not None and not hasattr(backbone, "forward_intermediates"):
+            raise ValueError(
+                f"Backbone {timm_model_id!r} does not support forward_intermediates; "
+                "hidden_state_index cannot be used."
+            )
 
         # Detect backbone output feature dimension via a probe forward pass.
         with torch.no_grad():
             dummy = torch.zeros(1, 3, image_size, image_size)
-            out = self.backbone(dummy)
+            out = self._backbone_forward(dummy)
             if out.ndim == 2:
                 backbone_dim = int(out.shape[-1])
                 self._out_format = "pooled"
@@ -206,6 +136,22 @@ class CharacterImageEncoder(nn.Module):
         # Post-projection norm for stable training (mirrors caption_norm pattern).
         self.norm = _RMSNorm(output_dim)
 
+    def _backbone_forward(self, images: torch.Tensor) -> torch.Tensor:
+        """Run the backbone, optionally returning an intermediate hidden state."""
+        if self._hidden_state_index is None:
+            return self.backbone(images)
+        intermediates = self.backbone.forward_intermediates(
+            images,
+            intermediates_only=True,
+        )  # type: ignore[attr-defined]
+        hidden_state = intermediates[self._hidden_state_index]
+        # maybe [batch_size, num_features, N, N]
+        batch_size, dim, h, w = hidden_state.size()
+
+        hidden_state = hidden_state.permute(0, 2, 3, 1).reshape(batch_size, h * w, dim)
+
+        return hidden_state
+
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         """
         Args:
@@ -214,7 +160,7 @@ class CharacterImageEncoder(nn.Module):
         Returns:
             Feature tensor of shape ``(B, N_tokens, output_dim)``.
         """
-        features = self.backbone(images)
+        features = self._backbone_forward(images)
 
         if self._out_format == "pooled":
             # (B, D) → (B, 1, D)

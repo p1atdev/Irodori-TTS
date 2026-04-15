@@ -4,7 +4,7 @@ IrodoriTTS の基本機能 (README.md 参照) に加えて、画像を参照し�
 
 ## Character Reference
 
-現状、Voice Design という機能で、テキストによって声のスタイルを指定することができるが、これと似たような形で、画像を参照として声のスタイルを決定する機能を実装したい。
+現状、Voice Design という機能で、テキストによって声のスタイルを指定することができるが、これと似たような形で、画像を参照として声のスタイルを決定する機能を実装。
 
 ### アーキテクチャ
 
@@ -22,7 +22,7 @@ import timm
 model = timm.create_model("hf_hub:SmilingWolf/wd-eva02-large-tagger-v3", pretrained=True)
 ```
 
-みたいな学習済みモデルを使えるようにする。モデルIDは色々変えて試したい。
+みたいな学習済みモデルを使えるようにする。
 
 ### 画像プロジェクター
 
@@ -49,7 +49,7 @@ model = timm.create_model("hf_hub:SmilingWolf/wd-eva02-large-tagger-v3", pretrai
 
 ### データセット
 
-データセットも新たに画像参照できるようにする必要があるので、実装が必要。
+データセットも新たに画像参照できるようにする必要がある。
 
 ## Previewing
 
@@ -58,13 +58,6 @@ model = timm.create_model("hf_hub:SmilingWolf/wd-eva02-large-tagger-v3", pretrai
 検証ロジックと同様に、一定のステップごとに指定されたプレビュー用設定をもとに、プレビュー生成をして wandb に記録する機能を作成する。
 
 プレビュー用設定には、生成するテキスト内容やその生成パラメータ、参照音声・参照キャプション・参照画像などのファイルパスを指定できるようにする。
-
-## Optimizer
-
-新たに optimizer として schedulefree ライブラリの RAdamScheduleFree を指定できるようにする。
-
-https://github.com/facebookresearch/schedule_free
-
 
 ## Python
 

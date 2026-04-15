@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 # ruff: noqa: E402
 import sys
 from pathlib import Path
@@ -12,7 +10,8 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import irodori_tts.image_encoder as image_encoder
-from irodori_tts.config import CharacterProjectorConfig, ModelConfig
+from irodori_tts.config import ModelConfig
+from irodori_tts.projector import MLPProjectorConfig
 from irodori_tts.model import TextToLatentRFDiT
 from irodori_tts.rf import sample_euler_rf_cfg
 
@@ -119,8 +118,7 @@ def test_character_projector_uses_explicit_initialization(monkeypatch) -> None:
         use_all_patches=True,
         image_size=8,
         pretrained=False,
-        projector_config=CharacterProjectorConfig(
-            type="mlp",
+        projector_config=MLPProjectorConfig(
             hidden_dim=128,
             num_layers=2,
         ),
