@@ -403,6 +403,7 @@ def build_ui() -> gr.Blocks:
                 label="Character Reference Image",
                 type="filepath",
                 image_mode="RGBA",
+                height="320px",
             )
 
         with gr.Accordion("Sampling", open=True):
