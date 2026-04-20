@@ -32,15 +32,21 @@ def resolve_runtime_device(device: str | torch.device) -> torch.device:
         return resolved
     if resolved.type == "cuda":
         if not torch.cuda.is_available():
-            raise ValueError("CUDA device requested but torch.cuda.is_available() is False.")
+            raise ValueError(
+                "CUDA device requested but torch.cuda.is_available() is False."
+            )
         return resolved
     if resolved.type == "mps":
         if resolved.index is not None:
             raise ValueError("MPS device index is not supported. Use 'mps'.")
         if not _is_mps_available():
-            raise ValueError("MPS device requested but torch.backends.mps.is_available() is False.")
+            raise ValueError(
+                "MPS device requested but torch.backends.mps.is_available() is False."
+            )
         return torch.device("mps")
-    raise ValueError(f"Unsupported inference device={resolved!s}. Expected one of: cpu, cuda, mps.")
+    raise ValueError(
+        f"Unsupported inference device={resolved!s}. Expected one of: cpu, cuda, mps."
+    )
 
 
 def list_available_runtime_devices() -> list[str]:
@@ -88,7 +94,9 @@ def _measure_start(device: torch.device, *extra_devices: torch.device) -> float:
     return time.perf_counter()
 
 
-def _measure_end(device: torch.device, t0: float, *extra_devices: torch.device) -> float:
+def _measure_end(
+    device: torch.device, t0: float, *extra_devices: torch.device
+) -> float:
     _sync_devices(device, *extra_devices)
     return time.perf_counter() - t0
 
@@ -120,7 +128,9 @@ def _maybe_compile_inference_model(
         raise RuntimeError("compile_model=True requires torch.compile (PyTorch 2+).")
     compile_kwargs = {"dynamic": bool(dynamic)}
     model.encode_conditions = torch.compile(model.encode_conditions, **compile_kwargs)
-    model.build_context_kv_cache = torch.compile(model.build_context_kv_cache, **compile_kwargs)
+    model.build_context_kv_cache = torch.compile(
+        model.build_context_kv_cache, **compile_kwargs
+    )
     model.forward_with_encoded_conditions = torch.compile(
         model.forward_with_encoded_conditions,
         **compile_kwargs,
@@ -136,7 +146,9 @@ def resolve_runtime_dtype(*, precision: str, device: torch.device) -> torch.dtyp
         if device.type != "cuda":
             raise ValueError("precision='bf16' currently requires CUDA device.")
         return torch.bfloat16
-    raise ValueError(f"Unsupported precision={precision!r}. Expected one of: fp32, bf16.")
+    raise ValueError(
+        f"Unsupported precision={precision!r}. Expected one of: fp32, bf16."
+    )
 
 
 SamplingRequest = generation_core.SamplingRequest
@@ -153,10 +165,16 @@ def _load_torch_checkpoint_payload(path: Path) -> dict:
 
 
 _CONFIG_META_KEY = "config_json"
-_INFERENCE_CONFIG_KEYS = {"max_text_len", "max_caption_len", "fixed_target_latent_steps"}
+_INFERENCE_CONFIG_KEYS = {
+    "max_text_len",
+    "max_caption_len",
+    "fixed_target_latent_steps",
+}
 
 
-def _load_checkpoint_from_pt(path: Path) -> tuple[dict[str, torch.Tensor], dict, dict | None]:
+def _load_checkpoint_from_pt(
+    path: Path,
+) -> tuple[dict[str, torch.Tensor], dict, dict | None]:
     ckpt = _load_torch_checkpoint_payload(path)
     model_state = ckpt.get("model")
     model_cfg = ckpt.get("model_config")
@@ -167,7 +185,9 @@ def _load_checkpoint_from_pt(path: Path) -> tuple[dict[str, torch.Tensor], dict,
     if not isinstance(model_cfg, dict):
         raise ValueError(f"Checkpoint missing model_config dictionary: {path}")
     if train_cfg is not None and not isinstance(train_cfg, dict):
-        raise ValueError(f"Checkpoint train_config must be a dictionary when present: {path}")
+        raise ValueError(
+            f"Checkpoint train_config must be a dictionary when present: {path}"
+        )
 
     if checkpoint_state_uses_lora(model_state):
         raise ValueError(
@@ -185,12 +205,16 @@ def _parse_json_mapping(
 ) -> dict | None:
     if raw is None:
         if required:
-            raise ValueError(f"Missing required metadata field '{field}' in checkpoint: {path}")
+            raise ValueError(
+                f"Missing required metadata field '{field}' in checkpoint: {path}"
+            )
         return None
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise ValueError(f"Invalid JSON in '{field}' metadata for checkpoint: {path}") from exc
+        raise ValueError(
+            f"Invalid JSON in '{field}' metadata for checkpoint: {path}"
+        ) from exc
     if not isinstance(payload, dict):
         raise ValueError(f"Metadata field '{field}' must decode to an object: {path}")
     return payload
@@ -206,13 +230,17 @@ def _extract_inference_train_config(raw: dict | None) -> dict | None:
         if value is None:
             continue
         if not isinstance(value, int):
-            raise ValueError(f"Inference config key '{key}' must be int, got {type(value)!r}.")
+            raise ValueError(
+                f"Inference config key '{key}' must be int, got {type(value)!r}."
+            )
         inference_cfg[key] = int(value)
 
     return inference_cfg or None
 
 
-def _split_flat_checkpoint_config(path: Path, flat_config: dict) -> tuple[dict, dict | None]:
+def _split_flat_checkpoint_config(
+    path: Path, flat_config: dict
+) -> tuple[dict, dict | None]:
     model_cfg: dict[str, object] = {}
     inference_cfg: dict[str, int] = {}
     for key, value in flat_config.items():
@@ -243,11 +271,15 @@ def _load_checkpoint_from_safetensors(
         path=path,
         required=True,
     )
-    model_cfg, inference_cfg = _split_flat_checkpoint_config(path=path, flat_config=flat_config)
+    model_cfg, inference_cfg = _split_flat_checkpoint_config(
+        path=path, flat_config=flat_config
+    )
     return model_state, model_cfg, inference_cfg
 
 
-def _load_checkpoint_for_inference(path: Path) -> tuple[dict[str, torch.Tensor], dict, dict | None]:
+def _load_checkpoint_for_inference(
+    path: Path,
+) -> tuple[dict[str, torch.Tensor], dict, dict | None]:
     if path.suffix.lower() == ".safetensors":
         return _load_checkpoint_from_safetensors(path)
     return _load_checkpoint_from_pt(path)
@@ -283,7 +315,7 @@ class InferenceRuntime:
         self._infer_lock = threading.Lock()
 
     @classmethod
-    def from_key(cls, key: RuntimeKey) -> InferenceRuntime:
+    def from_key(cls, key: RuntimeKey) -> "InferenceRuntime":
         model_device = resolve_runtime_device(key.model_device)
         codec_device = resolve_runtime_device(key.codec_device)
         model_dtype = resolve_runtime_dtype(
@@ -360,7 +392,10 @@ class InferenceRuntime:
             )
 
         character_image_transform = None
-        if model_cfg.use_character_condition and model_cfg.character_encoder_model is not None:
+        if (
+            model_cfg.use_character_condition
+            and model_cfg.character_encoder_model is not None
+        ):
             from .image_encoder import build_character_transform
 
             character_image_transform = build_character_transform(
@@ -432,7 +467,9 @@ class InferenceRuntime:
                 fixed_target_latent_steps=fixed_target_latent_steps,
                 log_fn=log_fn,
                 measure_start=lambda *devices: _measure_start(*devices),
-                measure_end=lambda t0, *devices: _measure_end(devices[0], t0, *devices[1:]),
+                measure_end=lambda t0, *devices: _measure_end(
+                    devices[0], t0, *devices[1:]
+                ),
             )
 
         _log("[runtime] done synthesize")
