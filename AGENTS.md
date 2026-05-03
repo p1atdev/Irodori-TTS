@@ -63,3 +63,10 @@ model = timm.create_model("hf_hub:SmilingWolf/wd-eva02-large-tagger-v3", pretrai
 
 python3 は使用できない。
 uv を使う。フォーマッタは ruff を使う。
+
+
+## Server
+
+FastAPI + OpenAPI + Scalar を使う。Scalar は以下参照:
+
+https://scalar.com/products/api-references/integrations/fastapi.md

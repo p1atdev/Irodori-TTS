@@ -15,20 +15,22 @@ model:
   use_character_condition: true
   # character_encoder_model: hf_hub:SmilingWolf/wd-swinv2-tagger-v3
   character_encoder_model: hf_hub:SmilingWolf/wd-vit-tagger-v3
-  character_hidden_state_index: -3
+  # character_encoder_model: hf_hub:timm/vit_base_patch16_siglip_512.v2_webli
+  character_hidden_state_index: -2
   character_dim: 768
   character_use_all_patches: true
   character_image_size: 448
-  character_attention_mode: cross  # joint or cross
+  character_attention_mode: joint  # joint or cross
   character_projector:
-    # type: mlp
-    # hidden_dim: 2048
-    # num_layers: 1
-    type: resampler
-    num_heads: 8
-    depth: 4
-    num_query_tokens: 16
-    mlp_ratio: 2.0
+    type: mlp
+    hidden_dim: 2048
+    num_layers: 1
+    # type: resampler
+    # num_heads: 12
+    # depth: 1
+    # num_query_tokens: 16
+    # mlp_ratio: 2.0
+    # qk_norm: true
   # Speaker encoder kept for architecture consistency but disabled via use_speaker_condition
   speaker_mlp_ratio: 2.6
   speaker_dim: 768
@@ -52,13 +54,13 @@ train:
   trainable_modules:
     - character_encoder.proj
     - character_encoder.norm
-    - regex: '^blocks\.\d+\.attention\.w[kv]_character(\.|$)'
+    # - regex: '^blocks\.\d+\.attention\.w[kv]_character(\.|$)'
 
   lora_enabled: false
   # optimizer / learning rate
   optimizer: radam_schedule_free
   # muon_momentum: 0.95
-  learning_rate: 0.001
+  learning_rate: 0.0001
   weight_decay: 0.01
   lr_scheduler: none # none, cosine, wsd
   # warmup_steps: 1000
@@ -68,7 +70,7 @@ train:
   adam_beta2: 0.99
   # adam_eps: 0.00000001
   # 
-  max_steps: 50000
+  max_steps: 20000
   #
   max_text_len: 32
   text_condition_dropout: 0.0
@@ -80,9 +82,9 @@ train:
   fixed_target_latent_steps: 750
   fixed_target_full_mask: true
   # 
-  log_every: 1
-  save_every: 100
-  checkpoint_best_n: 5
+  log_every: 10
+  save_every: 500
+  checkpoint_best_n: 10
   # 
   wandb_enabled: true
   wandb_project: irodori-tts-character
@@ -98,35 +100,68 @@ train:
   # Preview generation during training (requires wandb_enabled: true to log audio)
   preview_every: 100
   preview_samples:
-    - text: おはようございます！今日も一日頑張りましょう！
+    - text: その森には、古い言い伝えがありました。月が最も高く昇る夜、静かに耳を澄ませば、風の歌声が聞こえるというのです。
       image_path: data/sample/sample-01.webp
       num_steps: 20
-      seconds: 10.0
+      seconds: 20.0
       cfg_guidance_mode: independent # joint, alternating
       cfg_scale_text: 3.0
       cfg_scale_character: 5.0
       seed: 0
-    - text: おはようございます！今日も一日頑張りましょう！
+    - text: その森には、古い言い伝えがありました。月が最も高く昇る夜、静かに耳を澄ませば、風の歌声が聞こえるというのです。
       image_path: data/sample/sample-02.webp
       num_steps: 20
-      seconds: 10.0
+      seconds: 20.0
       cfg_guidance_mode: independent
       cfg_scale_text: 3.0
       cfg_scale_character: 3.0
       seed: 0
-    - text: おはようございます！今日も一日頑張りましょう！
+    - text: その森には、古い言い伝えがありました。月が最も高く昇る夜、静かに耳を澄ませば、風の歌声が聞こえるというのです。
       image_path: data/sample/sample-05.webp
       num_steps: 20
-      seconds: 10.0
+      seconds: 20.0
       cfg_guidance_mode: independent
       cfg_scale_text: 3.0
       cfg_scale_character: 3.0
       seed: 0
-    - text: おはようございます！今日も一日頑張りましょう！
+    - text: その森には、古い言い伝えがありました。月が最も高く昇る夜、静かに耳を澄ませば、風の歌声が聞こえるというのです。
       image_path: data/sample/sample-06.webp
       num_steps: 20
-      seconds: 10.0
+      seconds: 20.0
       cfg_guidance_mode: independent
       cfg_scale_text: 3.0
       cfg_scale_character: 3.0
       seed: 0
+    - text: その森には、古い言い伝えがありました。月が最も高く昇る夜、静かに耳を澄ませば、風の歌声が聞こえるというのです。
+      image_path: data/sample/sample-03.webp
+      num_steps: 20
+      seconds: 20.0
+      cfg_guidance_mode: independent # joint, alternating
+      cfg_scale_text: 3.0
+      cfg_scale_character: 5.0
+      seed: 0
+    - text: その森には、古い言い伝えがありました。月が最も高く昇る夜、静かに耳を澄ませば、風の歌声が聞こえるというのです。
+      image_path: data/sample/sample-04.webp
+      num_steps: 20
+      seconds: 20.0
+      cfg_guidance_mode: independent
+      cfg_scale_text: 3.0
+      cfg_scale_character: 3.0
+      seed: 0
+    - text: その森には、古い言い伝えがありました。月が最も高く昇る夜、静かに耳を澄ませば、風の歌声が聞こえるというのです。
+      image_path: data/sample/sample-07.webp
+      num_steps: 20
+      seconds: 20.0
+      cfg_guidance_mode: independent
+      cfg_scale_text: 3.0
+      cfg_scale_character: 3.0
+      seed: 0
+    - text: その森には、古い言い伝えがありました。月が最も高く昇る夜、静かに耳を澄ませば、風の歌声が聞こえるというのです。
+      image_path: data/sample/sample-08.webp
+      num_steps: 20
+      seconds: 20.0
+      cfg_guidance_mode: independent
+      cfg_scale_text: 3.0
+      cfg_scale_character: 3.0
+      seed: 0
+    
