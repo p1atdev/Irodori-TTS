@@ -15,6 +15,7 @@ class ResamplerProjectorConfig:
     depth: int = 4
     gradient_checkpointing: bool = False
     qk_norm: bool = True
+    is_gated: bool = False
 
 
 class PerceiverAttention(nn.Module):
@@ -23,6 +24,7 @@ class PerceiverAttention(nn.Module):
         in_features: int,
         num_heads: int,
         qk_norm: bool = True,
+        is_gated: bool = False,
     ):
         super().__init__()
 
@@ -30,6 +32,7 @@ class PerceiverAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = in_features // num_heads
         self.qk_norm = qk_norm
+        self.is_gated = is_gated
 
         self.norm1 = nn.RMSNorm(in_features)  # image features
         self.norm2 = nn.RMSNorm(in_features)  # latent queries
@@ -43,13 +46,16 @@ class PerceiverAttention(nn.Module):
         self.to_v = nn.Linear(in_features, in_features, bias=False)
         self.to_out = nn.Linear(in_features, in_features, bias=False)
 
+        if is_gated:
+            self.to_gate = nn.Linear(in_features, in_features, bias=False)
+
     def _pre_attn_reshape(self, tensor: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, _ = tensor.shape
         return tensor.view(batch_size, seq_len, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
 
-    def _post_attn_reshape(self, tensor: torch.Tensor) -> torch.Tensor:
-        batch_size, _num_heads, seq_len, _head_dim = tensor.shape
-        return tensor.permute(0, 2, 1, 3).reshape(batch_size, seq_len, self.in_features)
+    # def _post_attn_reshape(self, tensor: torch.Tensor) -> torch.Tensor:
+    #     batch_size, _num_heads, seq_len, _head_dim = tensor.shape
+    #     return tensor.permute(0, 2, 1, 3).reshape(batch_size, seq_len, self.in_features)
 
     def forward(self, image_features: torch.Tensor, latents: torch.Tensor) -> torch.Tensor:
         image_features = self.norm1(image_features)
@@ -69,13 +75,26 @@ class PerceiverAttention(nn.Module):
             key = self.norm_k(key)
 
         attn = F.scaled_dot_product_attention(query, key, value, is_causal=False)
-        attn = self._post_attn_reshape(attn)
+
+        batch_size, num_query_tokens, _ = latents.shape
+        attn = attn.permute(0, 2, 1, 3).contiguous()
+        if self.is_gated:
+            gate = self.to_gate(latents).reshape(
+                batch_size,
+                num_query_tokens,
+                self.num_heads,
+                self.head_dim,
+            )
+            attn = attn * torch.sigmoid(gate)
+        attn = attn.view(batch_size, num_query_tokens, self.in_features)
+
         return self.to_out(attn)
 
 
 class _SwiGLU(nn.Module):
     def __init__(self, dim: int, hidden_dim: int):
         super().__init__()
+
         self.w1 = nn.Linear(dim, hidden_dim, bias=False)
         self.w2 = nn.Linear(hidden_dim, dim, bias=False)
         self.w3 = nn.Linear(dim, hidden_dim, bias=False)
@@ -91,12 +110,14 @@ class ResamplerBlock(nn.Module):
         num_heads: int,
         mlp_ratio: float = 2.0,
         qk_norm: bool = True,
+        is_gated: bool = False,
     ):
         super().__init__()
         self.attn = PerceiverAttention(
             in_features=dim,
             num_heads=num_heads,
             qk_norm=qk_norm,
+            is_gated=is_gated,
         )
         self.mlp = _SwiGLU(dim=dim, hidden_dim=int(dim * mlp_ratio))
 
@@ -118,6 +139,7 @@ class ResamplerProjector(nn.Module):
         depth: int = 4,
         gradient_checkpointing: bool = False,
         qk_norm: bool = True,
+        is_gated: bool = False,
     ):
         super().__init__()
 
@@ -137,6 +159,7 @@ class ResamplerProjector(nn.Module):
                     num_heads=num_heads,
                     mlp_ratio=mlp_ratio,
                     qk_norm=qk_norm,
+                    is_gated=is_gated,
                 )
                 for _ in range(depth)
             ]

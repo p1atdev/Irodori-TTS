@@ -543,6 +543,9 @@ class TextEncoder(nn.Module):
         dropout: float,
     ):
         super().__init__()
+
+        self.vocab_dim = dim
+
         self.text_embedding = nn.Embedding(vocab_size, dim)
         self.blocks = nn.ModuleList(
             TextBlock(
@@ -572,6 +575,18 @@ class TextEncoder(nn.Module):
         mask_f = mask.unsqueeze(-1).to(dtype=x.dtype)
         x = x * mask_f
         freqs = self._rope_freqs(input_ids.shape[1], x.device)
+        for block in self.blocks:
+            x = block(x, mask=mask, freqs_cis=freqs)
+            x = x * mask_f
+        return x * mask_f
+
+    def encode_random_embed(self, mask: torch.Tensor) -> torch.Tensor:
+        # encode random embeddings intead of input ids
+        batch_size, seq_len = mask.shape
+        x = torch.randn((batch_size, seq_len, self.vocab_dim), device=mask.device)
+        mask_f = mask.unsqueeze(-1).to(dtype=x.dtype)
+        x = x * mask_f
+        freqs = self._rope_freqs(seq_len, x.device)
         for block in self.blocks:
             x = block(x, mask=mask, freqs_cis=freqs)
             x = x * mask_f

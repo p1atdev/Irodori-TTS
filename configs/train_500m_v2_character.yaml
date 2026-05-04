@@ -16,21 +16,22 @@ model:
   # character_encoder_model: hf_hub:SmilingWolf/wd-swinv2-tagger-v3
   character_encoder_model: hf_hub:SmilingWolf/wd-vit-tagger-v3
   # character_encoder_model: hf_hub:timm/vit_base_patch16_siglip_512.v2_webli
-  character_hidden_state_index: -2
+  character_hidden_state_index: -5
   character_dim: 768
   character_use_all_patches: true
   character_image_size: 448
   character_attention_mode: joint  # joint or cross
   character_projector:
-    type: mlp
-    hidden_dim: 2048
-    num_layers: 1
-    # type: resampler
-    # num_heads: 12
-    # depth: 1
-    # num_query_tokens: 16
-    # mlp_ratio: 2.0
-    # qk_norm: true
+    # type: mlp
+    # hidden_dim: 2048
+    # num_layers: 1
+    type: resampler
+    num_heads: 12
+    depth: 1
+    num_query_tokens: 32
+    mlp_ratio: 2.6
+    qk_norm: true
+    is_gated: true
   # Speaker encoder kept for architecture consistency but disabled via use_speaker_condition
   speaker_mlp_ratio: 2.6
   speaker_dim: 768

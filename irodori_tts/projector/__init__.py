@@ -57,6 +57,7 @@ def build_projector(
             depth=config.depth,
             gradient_checkpointing=config.gradient_checkpointing,
             qk_norm=config.qk_norm,
+            is_gated=config.is_gated,
         )
     raise ValueError(f"Unknown projector config type: {type(config).__name__}")
 
