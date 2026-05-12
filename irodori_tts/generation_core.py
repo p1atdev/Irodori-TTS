@@ -11,6 +11,7 @@ import torchaudio
 
 from .codec import DACVAECodec, patchify_latent, unpatchify_latent
 from .config import ModelConfig
+from .duration import build_duration_features
 from .rf import sample_euler_rf_cfg
 from .text_normalization import normalize_text
 from .tokenizer import PretrainedTextTokenizer
@@ -38,7 +39,10 @@ class SamplingRequest:
     ref_ensure_max: bool = True
     num_candidates: int = 1
     decode_mode: str = "sequential"
-    seconds: float = 30.0
+    seconds: float | None = None
+    duration_scale: float = 1.0
+    min_seconds: float = 0.5
+    max_seconds: float = 30.0
     max_ref_seconds: float | None = 30.0
     max_text_len: int | None = None
     max_caption_len: int | None = None
@@ -60,6 +64,8 @@ class SamplingRequest:
     speaker_kv_min_t: float | None = None
     speaker_kv_max_layers: int | None = None
     seed: int | None = None
+    t_schedule_mode: str = "linear"
+    sway_coeff: float = -1.0
     trim_tail: bool = True
     tail_window_size: int = 20
     tail_std_threshold: float = 0.05
@@ -462,8 +468,20 @@ def generate_from_components(
     messages: list[str] = []
     stage_timings: list[tuple[str, float]] = []
 
-    if request.seconds <= 0:
-        raise ValueError(f"seconds must be > 0, got {request.seconds}")
+    manual_seconds = None if request.seconds is None else float(request.seconds)
+    if manual_seconds is not None and manual_seconds <= 0:
+        raise ValueError(f"seconds must be > 0 when provided, got {request.seconds}")
+    duration_scale = float(request.duration_scale)
+    if duration_scale <= 0:
+        raise ValueError(f"duration_scale must be > 0, got {duration_scale}")
+    min_seconds = float(request.min_seconds)
+    max_seconds = float(request.max_seconds)
+    if min_seconds <= 0:
+        raise ValueError(f"min_seconds must be > 0, got {min_seconds}")
+    if max_seconds < min_seconds:
+        raise ValueError(
+            f"max_seconds must be >= min_seconds, got min={min_seconds} max={max_seconds}"
+        )
     batch_size = int(request.num_candidates)
     if batch_size <= 0:
         raise ValueError(f"num_candidates must be > 0, got {batch_size}")
@@ -574,24 +592,6 @@ def generate_from_components(
         if character_images is not None:
             character_images = character_images.to(dtype=next(model.parameters()).dtype)
 
-        target_samples, latent_steps, patched_steps = resolve_sequence_lengths(
-            seconds=float(request.seconds),
-            sample_rate=codec.sample_rate,
-            hop_length=int(codec.model.hop_length),
-            latent_patch_size=model_cfg.latent_patch_size,
-        )
-        if (
-            fixed_target_latent_steps is not None
-            and int(fixed_target_latent_steps) > 0
-            and latent_steps > int(fixed_target_latent_steps)
-        ):
-            msg = (
-                f"warning: requested latent length ({latent_steps}) exceeds fixed_target_latent_steps ({fixed_target_latent_steps}) "
-                "used in training. Long-tail stability may degrade."
-            )
-            messages.append(msg)
-            _log(msg)
-
         t0 = measure_start(model_device, resolved_codec_device)
         msg_count_before_ref = len(messages)
         ref_latent, ref_mask = prepare_reference_latent(
@@ -608,6 +608,105 @@ def generate_from_components(
         for msg in messages[msg_count_before_ref:]:
             _log(msg)
         _log(f"[runtime] prepare_reference: {stage_sec * 1000.0:.1f} ms")
+
+        hop_length = int(codec.model.hop_length)
+        if manual_seconds is not None:
+            clamped_seconds = min(max_seconds, max(min_seconds, manual_seconds))
+            if clamped_seconds != manual_seconds:
+                duration_msg = (
+                    f"warning: manual duration {manual_seconds:.3f}s was clamped to "
+                    f"{clamped_seconds:.3f}s."
+                )
+                messages.append(duration_msg)
+                _log(duration_msg)
+            target_samples, latent_steps, patched_steps = resolve_sequence_lengths(
+                seconds=clamped_seconds,
+                sample_rate=codec.sample_rate,
+                hop_length=hop_length,
+                latent_patch_size=model_cfg.latent_patch_size,
+            )
+            duration_msg = f"info: using manual duration {clamped_seconds:.3f}s."
+            messages.append(duration_msg)
+            _log(duration_msg)
+        elif model_cfg.use_duration_predictor:
+            t0 = measure_start(model_device)
+            has_speaker_duration = torch.zeros((batch_size,), dtype=torch.bool, device=model_device)
+            if model_cfg.use_speaker_condition and ref_mask is not None:
+                has_speaker_duration = ref_mask.any(dim=1)
+            duration_features = build_duration_features(
+                [normalized_text] * batch_size,
+                token_counts=text_mask.sum(dim=1),
+                max_text_len=int(text_mask.shape[1]),
+                has_speaker=has_speaker_duration,
+            ).to(model_device)
+            (
+                duration_text_state,
+                duration_text_mask,
+                duration_speaker_state,
+                _duration_speaker_mask,
+                _duration_caption_state,
+                _duration_caption_mask,
+                _duration_character_state,
+                _duration_character_mask,
+                _duration_character_noisy_state,
+            ) = model.encode_conditions(
+                text_input_ids=text_ids,
+                text_mask=text_mask,
+                speaker_latent=ref_latent,
+                speaker_mask=ref_mask,
+                caption_input_ids=caption_ids,
+                caption_mask=caption_mask,
+                character_images=character_images,
+            )
+            pred_log_frames = model.predict_duration_log_frames(
+                text_state=duration_text_state,
+                text_mask=duration_text_mask,
+                speaker_state=duration_speaker_state,
+                speaker_mask=_duration_speaker_mask,
+                duration_features=duration_features,
+                has_speaker=has_speaker_duration,
+            )
+            pred_frames = torch.expm1(pred_log_frames).float().mean().item()
+            scaled_frames = pred_frames * duration_scale
+            min_frames = max(1, math.ceil(min_seconds * codec.sample_rate / hop_length))
+            max_frames = max(1, math.floor(max_seconds * codec.sample_rate / hop_length))
+            latent_steps = int(round(scaled_frames))
+            latent_steps = max(min_frames, min(max_frames, latent_steps))
+            target_samples = int(latent_steps * hop_length)
+            patched_steps = max(1, math.ceil(latent_steps / int(model_cfg.latent_patch_size)))
+            stage_sec = measure_end(t0, model_device)
+            stage_timings.append(("predict_duration", stage_sec))
+            msg = (
+                f"info: predicted duration frames={pred_frames:.1f}, "
+                f"scale={duration_scale:.3f}, using_frames={latent_steps} "
+                f"({target_samples / float(codec.sample_rate):.3f}s)."
+            )
+            messages.append(msg)
+            _log(msg)
+            _log(f"[runtime] predict_duration: {stage_sec * 1000.0:.1f} ms")
+        else:
+            fallback_seconds = 30.0
+            target_samples, latent_steps, patched_steps = resolve_sequence_lengths(
+                seconds=fallback_seconds,
+                sample_rate=codec.sample_rate,
+                hop_length=hop_length,
+                latent_patch_size=model_cfg.latent_patch_size,
+            )
+            msg = "info: checkpoint has no duration predictor; falling back to 30.000s."
+            messages.append(msg)
+            _log(msg)
+
+        if (
+            fixed_target_latent_steps is not None
+            and int(fixed_target_latent_steps) > 0
+            and latent_steps > int(fixed_target_latent_steps)
+        ):
+            msg = (
+                f"warning: requested latent length ({latent_steps}) exceeds fixed_target_latent_steps ({fixed_target_latent_steps}) "
+                "used in training. Long-tail stability may degrade."
+            )
+            messages.append(msg)
+            _log(msg)
 
         t0 = measure_start(model_device)
         autocast_context = (
@@ -643,6 +742,8 @@ def generate_from_components(
                 speaker_kv_scale=speaker_kv_scale,
                 speaker_kv_max_layers=speaker_kv_max_layers,
                 speaker_kv_min_t=speaker_kv_min_t,
+                t_schedule_mode=str(request.t_schedule_mode),
+                sway_coeff=float(request.sway_coeff),
             )
         stage_sec = measure_end(t0, model_device)
         stage_timings.append(("sample_rf", stage_sec))

@@ -17,6 +17,7 @@ from .config import ModelConfig
 from .lora import checkpoint_state_uses_lora
 from .model import TextToLatentRFDiT
 from .tokenizer import PretrainedTextTokenizer
+from .watermark import SilentCipherWatermarker
 
 
 def _is_mps_available() -> bool:
@@ -32,21 +33,15 @@ def resolve_runtime_device(device: str | torch.device) -> torch.device:
         return resolved
     if resolved.type == "cuda":
         if not torch.cuda.is_available():
-            raise ValueError(
-                "CUDA device requested but torch.cuda.is_available() is False."
-            )
+            raise ValueError("CUDA device requested but torch.cuda.is_available() is False.")
         return resolved
     if resolved.type == "mps":
         if resolved.index is not None:
             raise ValueError("MPS device index is not supported. Use 'mps'.")
         if not _is_mps_available():
-            raise ValueError(
-                "MPS device requested but torch.backends.mps.is_available() is False."
-            )
+            raise ValueError("MPS device requested but torch.backends.mps.is_available() is False.")
         return torch.device("mps")
-    raise ValueError(
-        f"Unsupported inference device={resolved!s}. Expected one of: cpu, cuda, mps."
-    )
+    raise ValueError(f"Unsupported inference device={resolved!s}. Expected one of: cpu, cuda, mps.")
 
 
 def list_available_runtime_devices() -> list[str]:
@@ -94,9 +89,7 @@ def _measure_start(device: torch.device, *extra_devices: torch.device) -> float:
     return time.perf_counter()
 
 
-def _measure_end(
-    device: torch.device, t0: float, *extra_devices: torch.device
-) -> float:
+def _measure_end(device: torch.device, t0: float, *extra_devices: torch.device) -> float:
     _sync_devices(device, *extra_devices)
     return time.perf_counter() - t0
 
@@ -111,7 +104,6 @@ class RuntimeKey:
     codec_precision: str = "fp32"
     codec_deterministic_encode: bool = True
     codec_deterministic_decode: bool = True
-    enable_watermark: bool = False
     compile_model: bool = False
     compile_dynamic: bool = False
 
@@ -128,9 +120,7 @@ def _maybe_compile_inference_model(
         raise RuntimeError("compile_model=True requires torch.compile (PyTorch 2+).")
     compile_kwargs = {"dynamic": bool(dynamic)}
     model.encode_conditions = torch.compile(model.encode_conditions, **compile_kwargs)
-    model.build_context_kv_cache = torch.compile(
-        model.build_context_kv_cache, **compile_kwargs
-    )
+    model.build_context_kv_cache = torch.compile(model.build_context_kv_cache, **compile_kwargs)
     model.forward_with_encoded_conditions = torch.compile(
         model.forward_with_encoded_conditions,
         **compile_kwargs,
@@ -146,9 +136,7 @@ def resolve_runtime_dtype(*, precision: str, device: torch.device) -> torch.dtyp
         if device.type != "cuda":
             raise ValueError("precision='bf16' currently requires CUDA device.")
         return torch.bfloat16
-    raise ValueError(
-        f"Unsupported precision={precision!r}. Expected one of: fp32, bf16."
-    )
+    raise ValueError(f"Unsupported precision={precision!r}. Expected one of: fp32, bf16.")
 
 
 SamplingRequest = generation_core.SamplingRequest
@@ -185,9 +173,7 @@ def _load_checkpoint_from_pt(
     if not isinstance(model_cfg, dict):
         raise ValueError(f"Checkpoint missing model_config dictionary: {path}")
     if train_cfg is not None and not isinstance(train_cfg, dict):
-        raise ValueError(
-            f"Checkpoint train_config must be a dictionary when present: {path}"
-        )
+        raise ValueError(f"Checkpoint train_config must be a dictionary when present: {path}")
 
     if checkpoint_state_uses_lora(model_state):
         raise ValueError(
@@ -205,16 +191,12 @@ def _parse_json_mapping(
 ) -> dict | None:
     if raw is None:
         if required:
-            raise ValueError(
-                f"Missing required metadata field '{field}' in checkpoint: {path}"
-            )
+            raise ValueError(f"Missing required metadata field '{field}' in checkpoint: {path}")
         return None
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise ValueError(
-            f"Invalid JSON in '{field}' metadata for checkpoint: {path}"
-        ) from exc
+        raise ValueError(f"Invalid JSON in '{field}' metadata for checkpoint: {path}") from exc
     if not isinstance(payload, dict):
         raise ValueError(f"Metadata field '{field}' must decode to an object: {path}")
     return payload
@@ -230,17 +212,13 @@ def _extract_inference_train_config(raw: dict | None) -> dict | None:
         if value is None:
             continue
         if not isinstance(value, int):
-            raise ValueError(
-                f"Inference config key '{key}' must be int, got {type(value)!r}."
-            )
+            raise ValueError(f"Inference config key '{key}' must be int, got {type(value)!r}.")
         inference_cfg[key] = int(value)
 
     return inference_cfg or None
 
 
-def _split_flat_checkpoint_config(
-    path: Path, flat_config: dict
-) -> tuple[dict, dict | None]:
+def _split_flat_checkpoint_config(path: Path, flat_config: dict) -> tuple[dict, dict | None]:
     model_cfg: dict[str, object] = {}
     inference_cfg: dict[str, int] = {}
     for key, value in flat_config.items():
@@ -271,9 +249,7 @@ def _load_checkpoint_from_safetensors(
         path=path,
         required=True,
     )
-    model_cfg, inference_cfg = _split_flat_checkpoint_config(
-        path=path, flat_config=flat_config
-    )
+    model_cfg, inference_cfg = _split_flat_checkpoint_config(path=path, flat_config=flat_config)
     return model_state, model_cfg, inference_cfg
 
 
@@ -312,6 +288,7 @@ class InferenceRuntime:
         self.default_text_max_len = default_text_max_len
         self.default_caption_max_len = default_caption_max_len
         self.character_image_transform = character_image_transform
+        self.watermarker = SilentCipherWatermarker(device=str(self.codec_device))
         self._infer_lock = threading.Lock()
 
     @classmethod
@@ -383,7 +360,6 @@ class InferenceRuntime:
             dtype=codec_dtype,
             deterministic_encode=bool(key.codec_deterministic_encode),
             deterministic_decode=bool(key.codec_deterministic_decode),
-            enable_watermark=bool(key.enable_watermark),
         )
         if model_cfg.latent_dim != codec.latent_dim:
             raise ValueError(
@@ -392,10 +368,7 @@ class InferenceRuntime:
             )
 
         character_image_transform = None
-        if (
-            model_cfg.use_character_condition
-            and model_cfg.character_encoder_model is not None
-        ):
+        if model_cfg.use_character_condition and model_cfg.character_encoder_model is not None:
             from .image_encoder import build_character_transform
 
             character_image_transform = build_character_transform(
@@ -430,13 +403,13 @@ class InferenceRuntime:
             (
                 "[runtime] start synthesize "
                 "model_device={} model_precision={} codec_device={} codec_precision={} "
-                "watermark={} mode={} seconds={} steps={} seed={} candidates={} decode_mode={}"
+                "silentcipher_watermark={} mode={} seconds={} steps={} seed={} candidates={} decode_mode={}"
             ).format(
                 self.key.model_device,
                 self.key.model_precision,
                 self.key.codec_device,
                 self.key.codec_precision,
-                self.codec.enable_watermark,
+                self.watermarker.ready,
                 req.cfg_guidance_mode,
                 req.seconds,
                 req.num_steps,
@@ -467,10 +440,26 @@ class InferenceRuntime:
                 fixed_target_latent_steps=fixed_target_latent_steps,
                 log_fn=log_fn,
                 measure_start=lambda *devices: _measure_start(*devices),
-                measure_end=lambda t0, *devices: _measure_end(
-                    devices[0], t0, *devices[1:]
-                ),
+                measure_end=lambda t0, *devices: _measure_end(devices[0], t0, *devices[1:]),
             )
+            if self.watermarker.ready:
+                t0 = _measure_start(self.codec_device)
+                result.audios = self.watermarker.encode_batch(
+                    result.audios,
+                    sample_rate=int(result.sample_rate),
+                )
+                result.audio = result.audios[0]
+                stage_sec = _measure_end(self.codec_device, t0)
+                result.stage_timings.append(("silentcipher_watermark", stage_sec))
+                result.total_to_decode += stage_sec
+                _log(f"[runtime] silentcipher_watermark: {stage_sec * 1000.0:.1f} ms")
+            else:
+                msg = (
+                    "warning: SilentCipher watermark is unavailable; generated audio was not "
+                    "watermarked."
+                )
+                result.messages.append(msg)
+                _log(msg)
 
         _log("[runtime] done synthesize")
         return result

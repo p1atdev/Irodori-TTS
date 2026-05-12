@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -12,7 +13,10 @@ from torch.utils.data import Dataset
 from tqdm import tqdm
 
 from .codec import patchify_latent
+from .duration import build_duration_features
 from .tokenizer import PretrainedTextTokenizer
+
+_MANIFEST_INDEX_CACHE_VERSION = 1
 
 
 def _coerce_latent_shape(latent: torch.Tensor, latent_dim: int) -> torch.Tensor:
@@ -175,6 +179,9 @@ class LatentTextDataset(Dataset):
         else:
             ref_item = self._read_item(ref_index)
             ref_latent = self._load_latent(ref_item["latent_path"])
+        manifest_num_frames = int(item.get("num_frames", latent.shape[0]))
+        num_frames = min(manifest_num_frames, int(latent.shape[0]))
+
         out: dict[str, Any] = {
             "text": item["text"],
             "caption": str(item.get(self.caption_key, "")) if self.enable_caption_condition else "",
@@ -182,6 +189,7 @@ class LatentTextDataset(Dataset):
             if self.enable_caption_condition
             else False,
             "latent": latent,
+            "num_frames": num_frames,
             "ref_latent": ref_latent,
             "has_speaker": has_speaker,
         }
@@ -223,6 +231,100 @@ class _ManifestIndex:
     caption_key: str
     image_key: str
 
+    @staticmethod
+    def _cache_path(manifest_path: Path, caption_key: str, image_key: str = "image_path") -> Path:
+        suffix = ".irodori_index.pt"
+        cache_keys = []
+        if caption_key != "caption":
+            cache_keys.append(("caption", caption_key))
+        if image_key != "image_path":
+            cache_keys.append(("image", image_key))
+        if cache_keys:
+            safe_keys = ".".join(
+                f"{name}_{''.join(ch if ch.isalnum() or ch in {'-', '_'} else '_' for ch in value)}"
+                for name, value in cache_keys
+            )
+            suffix = f".{safe_keys}.irodori_index.pt"
+        return manifest_path.with_name(manifest_path.name + suffix)
+
+    @staticmethod
+    def _load_cache(
+        manifest_path: Path,
+        caption_key: str,
+        image_key: str = "image_path",
+    ) -> _ManifestIndex | None:
+        cache_path = _ManifestIndex._cache_path(manifest_path, caption_key, image_key)
+        if not cache_path.exists():
+            return None
+        stat = manifest_path.stat()
+        try:
+            payload = torch.load(cache_path, map_location="cpu", weights_only=True)
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("version") != _MANIFEST_INDEX_CACHE_VERSION:
+            return None
+        if payload.get("manifest_size") != stat.st_size:
+            return None
+        if payload.get("manifest_mtime_ns") != stat.st_mtime_ns:
+            return None
+        if payload.get("caption_key") != caption_key:
+            return None
+        if payload.get("image_key") != image_key:
+            return None
+
+        offsets = payload.get("offsets")
+        speaker_ids = payload.get("speaker_ids")
+        has_caption = payload.get("has_caption")
+        has_image = payload.get("has_image")
+        if not isinstance(offsets, torch.Tensor) or offsets.ndim != 1:
+            return None
+        if not isinstance(has_caption, torch.Tensor) or has_caption.ndim != 1:
+            return None
+        if not isinstance(has_image, torch.Tensor) or has_image.ndim != 1:
+            return None
+        if not isinstance(speaker_ids, list):
+            return None
+        if (
+            offsets.numel() != has_caption.numel()
+            or offsets.numel() != has_image.numel()
+            or offsets.numel() != len(speaker_ids)
+        ):
+            return None
+        return _ManifestIndex(
+            offsets=[int(x) for x in offsets.tolist()],
+            speaker_ids=[None if x is None else str(x) for x in speaker_ids],
+            has_caption=[bool(x) for x in has_caption.tolist()],
+            has_image=[bool(x) for x in has_image.tolist()],
+            caption_key=str(caption_key),
+            image_key=str(payload.get("image_key", "image_path")),
+        )
+
+    def _save_cache(self, manifest_path: Path) -> None:
+        cache_path = self._cache_path(manifest_path, self.caption_key, self.image_key)
+        stat = manifest_path.stat()
+        payload = {
+            "version": _MANIFEST_INDEX_CACHE_VERSION,
+            "manifest_size": stat.st_size,
+            "manifest_mtime_ns": stat.st_mtime_ns,
+            "caption_key": self.caption_key,
+            "offsets": torch.tensor(self.offsets, dtype=torch.int64),
+            "speaker_ids": self.speaker_ids,
+            "has_caption": torch.tensor(self.has_caption, dtype=torch.bool),
+            "has_image": torch.tensor(self.has_image, dtype=torch.bool),
+            "image_key": self.image_key,
+        }
+        tmp_path = cache_path.with_name(f"{cache_path.name}.{os.getpid()}.tmp")
+        try:
+            torch.save(payload, tmp_path)
+            tmp_path.replace(cache_path)
+        except Exception:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
     @classmethod
     def build(
         cls,
@@ -233,6 +335,17 @@ class _ManifestIndex:
         show_progress: bool = False,
         progress_desc: str | None = None,
     ) -> _ManifestIndex:
+        caption_key = str(caption_key)
+        image_key = str(image_key)
+        cached = cls._load_cache(manifest_path, caption_key, image_key)
+        if cached is not None:
+            if show_progress:
+                print(
+                    "Loaded manifest index cache: "
+                    f"{cls._cache_path(manifest_path, caption_key, image_key)}"
+                )
+            return cached
+
         offsets: list[int] = []
         speaker_ids: list[str | None] = []
         has_caption: list[bool] = []
@@ -273,7 +386,7 @@ class _ManifestIndex:
                 pbar.close()
         if not offsets:
             raise ValueError(f"No valid samples in manifest: {manifest_path}")
-        return cls(
+        index = cls(
             offsets=offsets,
             speaker_ids=speaker_ids,
             has_caption=has_caption,
@@ -281,6 +394,8 @@ class _ManifestIndex:
             caption_key=str(caption_key),
             image_key=str(image_key),
         )
+        index._save_cache(manifest_path)
+        return index
 
 
 @dataclass
@@ -304,6 +419,7 @@ class TTSCollator:
         bsz = len(latents)
 
         text_ids, text_mask = self.tokenizer.batch_encode(texts, max_length=self.max_text_len)
+        token_counts = text_mask.sum(dim=1)
         caption_ids = None
         caption_mask = None
         if self.caption_tokenizer is not None:
@@ -364,6 +480,13 @@ class TTSCollator:
         out = {
             "text_ids": text_ids,
             "text_mask": text_mask,
+            "num_frames": torch.tensor([int(x["num_frames"]) for x in batch], dtype=torch.long),
+            "duration_features": build_duration_features(
+                texts,
+                token_counts=token_counts,
+                max_text_len=self.max_text_len,
+                has_speaker=has_speaker,
+            ),
             "latent": latent_batch,
             "latent_mask": latent_mask,
             "latent_mask_valid": latent_mask_valid,

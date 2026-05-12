@@ -53,6 +53,15 @@ class ModelConfig:
     timestep_embed_dim: int = 512
     adaln_rank: int = 256
     norm_eps: float = 1e-5
+    use_duration_predictor: bool = False
+    duration_aux_dim: int = 14
+    duration_hidden_dim: int = 1024
+    duration_layers: int = 3
+    duration_dropout: float = 0.1
+    duration_attention_heads: int = 8
+    duration_architecture: str = "token_sum_adarn_zero_no_aux"
+    duration_token_init_frames: float = 9.0
+    duration_speaker_fusion: str = "adarn_zero"
 
     @property
     def patched_latent_dim(self) -> int:
@@ -144,6 +153,7 @@ class TrainConfig:
     allow_tf32: bool = False
     compile_model: bool = False
     gradient_checkpointing: bool = False
+    train_mode: str = "rf"
     learning_rate: float = 1e-4
     weight_decay: float = 0.01
     optimizer: str = "muon"
@@ -182,6 +192,10 @@ class TrainConfig:
     max_latent_steps: int = 750
     fixed_target_latent_steps: int | None = 750
     fixed_target_full_mask: bool = True
+    rf_loss_mode: str = "echo"
+    duration_loss_weight: float = 0.1
+    duration_speaker_dropout: float = 0.1
+    duration_huber_delta: float = 0.1
     timestep_logit_mean: float = 0.0
     timestep_logit_std: float = 1.0
     timestep_stratified: bool = True
@@ -200,6 +214,7 @@ class TrainConfig:
     lora_bias: str = "none"
     lora_target_modules: str = "diffusion_attn"
     trainable_modules: list[str | RegexModule] | None = None
+    lora_modules_to_save: str | None = "auto"
     seed: int = 0
     preview_every: int = 0
     preview_samples: list | None = None
