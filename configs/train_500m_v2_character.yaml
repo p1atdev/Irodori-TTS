@@ -20,6 +20,7 @@ model:
   character_dim: 768
   character_use_all_patches: true
   character_image_size: 448
+  # character_image_size: 512 # siglip2
   character_attention_mode: joint  # joint or cross
   character_projector:
     # type: mlp
@@ -28,7 +29,7 @@ model:
     type: resampler
     num_heads: 12
     depth: 1
-    num_query_tokens: 32
+    num_query_tokens: 16
     mlp_ratio: 2.6
     qk_norm: true
     is_gated: true
@@ -86,6 +87,9 @@ train:
   log_every: 10
   save_every: 500
   checkpoint_best_n: 10
+  # EMA: when enabled, training previews and saves both regular and EMA weights.
+  ema_enabled: true
+  ema_decay: 0.999
   # 
   wandb_enabled: true
   wandb_project: irodori-tts-character
@@ -165,4 +169,3 @@ train:
       cfg_scale_text: 3.0
       cfg_scale_character: 3.0
       seed: 0
-    

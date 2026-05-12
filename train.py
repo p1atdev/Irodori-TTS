@@ -10,7 +10,7 @@ import shutil
 import sys
 import warnings
 from collections.abc import Callable
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
@@ -112,9 +112,13 @@ def save_checkpoint(
     train_cfg: TrainConfig,
     *,
     base_init: dict | None = None,
+    model_state_dict: dict[str, torch.Tensor] | None = None,
+    extra_state: dict | None = None,
 ) -> None:
     path = Path(path)
     if train_config_uses_lora(train_cfg):
+        if model_state_dict is not None:
+            raise ValueError("LoRA checkpoint saving does not support model_state_dict override.")
         if path.exists():
             _safe_unlink(path)
         path.mkdir(parents=True, exist_ok=True)
@@ -128,31 +132,31 @@ def save_checkpoint(
             json.dumps({"base_init": base_init}, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-        torch.save(
-            {
-                "step": step,
-                "optimizer": optimizer.state_dict(),
-                "scheduler": None if scheduler is None else scheduler.state_dict(),
-                "model_config": asdict(model_cfg),
-                "train_config": asdict(train_cfg),
-                "base_init": base_init,
-            },
-            path / LORA_TRAINER_STATE_NAME,
-        )
-        return
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
+        payload = {
             "step": step,
-            "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "scheduler": None if scheduler is None else scheduler.state_dict(),
             "model_config": asdict(model_cfg),
             "train_config": asdict(train_cfg),
-        },
-        path,
-    )
+            "base_init": base_init,
+        }
+        if extra_state:
+            payload.update(extra_state)
+        torch.save(payload, path / LORA_TRAINER_STATE_NAME)
+        return
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "step": step,
+        "model": model_state_dict if model_state_dict is not None else model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": None if scheduler is None else scheduler.state_dict(),
+        "model_config": asdict(model_cfg),
+        "train_config": asdict(train_cfg),
+    }
+    if extra_state:
+        payload.update(extra_state)
+    torch.save(payload, path)
 
 
 def _safe_unlink(path: Path) -> None:
@@ -163,6 +167,169 @@ def _safe_unlink(path: Path) -> None:
             path.unlink()
     except FileNotFoundError:
         return
+
+
+def _ema_checkpoint_path(path: Path) -> Path:
+    if path.suffix:
+        return path.with_name(f"{path.stem}_ema{path.suffix}")
+    return path.with_name(f"{path.name}_ema")
+
+
+def _safe_unlink_checkpoint_family(path: Path) -> None:
+    _safe_unlink(path)
+    _safe_unlink(_ema_checkpoint_path(path))
+
+
+class ModelEMA:
+    """Exponential moving average for trainable floating-point model parameters."""
+
+    def __init__(self, model: torch.nn.Module, *, decay: float) -> None:
+        self.decay = float(decay)
+        self.num_updates = 0
+        self.shadow: dict[str, torch.Tensor] = {}
+        for name, param in model.named_parameters():
+            if param.requires_grad and param.is_floating_point():
+                self.shadow[name] = param.detach().clone()
+        if not self.shadow:
+            raise ValueError("EMA is enabled, but the model has no trainable floating parameters.")
+
+    @torch.no_grad()
+    def update(self, model: torch.nn.Module) -> None:
+        self.num_updates += 1
+        decay = self.decay
+        one_minus_decay = 1.0 - decay
+        current_params = dict(model.named_parameters())
+        for name, shadow in self.shadow.items():
+            param = current_params.get(name)
+            if param is None:
+                raise KeyError(f"EMA parameter disappeared from model: {name}")
+            shadow.mul_(decay).add_(param.detach(), alpha=one_minus_decay)
+
+    def state_dict_for_save(self, model: torch.nn.Module) -> dict[str, torch.Tensor]:
+        state = model.state_dict()
+        for name, shadow in self.shadow.items():
+            if name in state:
+                state[name] = shadow.detach()
+        return state
+
+    @torch.no_grad()
+    def load_model_state_dict(self, state_dict: dict[str, torch.Tensor]) -> None:
+        for name, shadow in self.shadow.items():
+            tensor = state_dict.get(name)
+            if tensor is None:
+                continue
+            if tuple(tensor.shape) != tuple(shadow.shape):
+                raise ValueError(
+                    f"EMA state shape mismatch for {name}: "
+                    f"checkpoint={tuple(tensor.shape)} current={tuple(shadow.shape)}"
+                )
+            shadow.copy_(tensor.detach().to(device=shadow.device, dtype=shadow.dtype))
+
+    @contextmanager
+    def apply_to(self, model: torch.nn.Module):
+        params = dict(model.named_parameters())
+        backup: dict[str, torch.Tensor] = {}
+        with torch.no_grad():
+            try:
+                for name, shadow in self.shadow.items():
+                    param = params.get(name)
+                    if param is None:
+                        raise KeyError(f"EMA parameter disappeared from model: {name}")
+                    backup[name] = param.detach().clone()
+                    param.copy_(shadow.to(device=param.device, dtype=param.dtype))
+                yield
+            finally:
+                for name, tensor in backup.items():
+                    params[name].copy_(tensor)
+
+
+def save_ema_checkpoint(
+    path: str | Path,
+    *,
+    ema: ModelEMA,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler,
+    step: int,
+    model_cfg: ModelConfig,
+    train_cfg: TrainConfig,
+    base_init: dict | None,
+) -> None:
+    extra_state = {
+        "checkpoint_variant": "ema",
+        "ema_decay": float(ema.decay),
+        "ema_num_updates": int(ema.num_updates),
+    }
+    if train_config_uses_lora(train_cfg):
+        with ema.apply_to(model):
+            save_checkpoint(
+                path=path,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                step=step,
+                model_cfg=model_cfg,
+                train_cfg=train_cfg,
+                base_init=base_init,
+                extra_state=extra_state,
+            )
+        return
+
+    save_checkpoint(
+        path=path,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        step=step,
+        model_cfg=model_cfg,
+        train_cfg=train_cfg,
+        base_init=base_init,
+        model_state_dict=ema.state_dict_for_save(model),
+        extra_state=extra_state,
+    )
+
+
+def save_checkpoint_pair(
+    path: str | Path,
+    *,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler,
+    step: int,
+    model_cfg: ModelConfig,
+    train_cfg: TrainConfig,
+    base_init: dict | None,
+    ema: ModelEMA | None,
+) -> None:
+    path = Path(path)
+    save_checkpoint(
+        path=path,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        step=step,
+        model_cfg=model_cfg,
+        train_cfg=train_cfg,
+        base_init=base_init,
+    )
+    if ema is not None:
+        save_ema_checkpoint(
+            _ema_checkpoint_path(path),
+            ema=ema,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            step=step,
+            model_cfg=model_cfg,
+            train_cfg=train_cfg,
+            base_init=base_init,
+        )
+
+
+def _validation_model_context(ema: ModelEMA | None, model: torch.nn.Module):
+    if ema is None:
+        return nullcontext()
+    return ema.apply_to(model)
 
 
 def list_periodic_checkpoints(output_dir: Path) -> list[tuple[int, Path]]:
@@ -181,7 +348,7 @@ def enforce_periodic_checkpoint_limit(output_dir: Path, keep_count: int) -> None
         return
     checkpoints = list_periodic_checkpoints(output_dir)
     for _, stale_path in checkpoints[keep_count:]:
-        _safe_unlink(stale_path)
+        _safe_unlink_checkpoint_family(stale_path)
 
 
 def list_best_val_loss_checkpoints(output_dir: Path) -> list[tuple[float, int, Path]]:
@@ -206,7 +373,7 @@ def prune_best_val_loss_checkpoints(
     checkpoints = sorted(checkpoints, key=lambda item: (item[0], item[1]))
     while len(checkpoints) > keep_best_n:
         _, _, stale_path = checkpoints.pop()
-        _safe_unlink(stale_path)
+        _safe_unlink_checkpoint_family(stale_path)
     return checkpoints
 
 
@@ -223,6 +390,7 @@ def maybe_save_best_val_loss_checkpoint(
     model_cfg: ModelConfig,
     train_cfg: TrainConfig,
     base_init: dict | None,
+    ema: ModelEMA | None = None,
 ) -> tuple[list[tuple[float, int, Path]], Path | None]:
     if keep_best_n <= 0:
         return checkpoints, None
@@ -236,13 +404,13 @@ def maybe_save_best_val_loss_checkpoint(
     kept: list[tuple[float, int, Path]] = []
     for score, saved_step, path in checkpoints:
         if saved_step == step:
-            _safe_unlink(path)
+            _safe_unlink_checkpoint_family(path)
             continue
         kept.append((score, saved_step, path))
     checkpoints = kept
 
     path = _best_checkpoint_path(output_dir, step=step, val_loss=val_loss, train_cfg=train_cfg)
-    save_checkpoint(
+    save_checkpoint_pair(
         path=path,
         model=model,
         optimizer=optimizer,
@@ -251,6 +419,7 @@ def maybe_save_best_val_loss_checkpoint(
         model_cfg=model_cfg,
         train_cfg=train_cfg,
         base_init=base_init,
+        ema=ema,
     )
     checkpoints.append((float(val_loss), int(step), path))
     checkpoints = prune_best_val_loss_checkpoints(checkpoints, keep_best_n)
@@ -1239,7 +1408,7 @@ class PreviewSampleConfig:
     speaker_kv_max_layers: int | None = None
     speaker_kv_min_t: float | None = None
     seed: int = 0
-    trim_trail: bool = True
+    trim_tail: bool = True
 
 
 def parse_preview_samples(preview_samples: list | None) -> list[PreviewSampleConfig]:
@@ -1254,6 +1423,14 @@ def parse_preview_samples(preview_samples: list | None) -> list[PreviewSampleCon
                 "preview_samples entries must be dictionaries, "
                 f"got {type(sample)!r} at index {idx}."
             )
+        sample = dict(sample)
+        if "trim_trail" in sample:
+            if "trim_tail" in sample and sample["trim_tail"] != sample["trim_trail"]:
+                raise ValueError(
+                    "preview_samples entries cannot set both 'trim_tail' and "
+                    f"legacy 'trim_trail' to different values at index {idx}."
+                )
+            sample["trim_tail"] = sample.pop("trim_trail")
         parsed.append(PreviewSampleConfig(**sample))
     return parsed
 
@@ -1341,7 +1518,7 @@ def preview_sample_to_sampling_request(cfg: PreviewSampleConfig) -> tuple[Sampli
             speaker_kv_min_t=cfg.speaker_kv_min_t,
             speaker_kv_max_layers=cfg.speaker_kv_max_layers,
             seed=int(cfg.seed),
-            trim_tail=cfg.trim_trail,
+            trim_tail=cfg.trim_tail,
         ),
         normalized_text,
     )
@@ -1388,6 +1565,7 @@ def run_preview(
     caption_tokenizer,
     character_image_transform: Callable | None,
     wandb_run,
+    log_prefix: str = "preview",
 ) -> None:
     """Generate preview audio samples and log them to wandb."""
     was_training = model.training
@@ -1418,7 +1596,7 @@ def run_preview(
                 )
                 audio_np = result.audio[0].cpu().float().numpy()
 
-                key = f"preview/audio_{i}"
+                key = f"{log_prefix}/audio_{i}"
                 try:
                     audio_logs[key] = wandb.Audio(
                         audio_np,
@@ -1709,6 +1887,22 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--ema",
+        dest="ema_enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Enable exponential moving average of trainable model weights. "
+            "When enabled, training saves and previews both regular and EMA weights."
+        ),
+    )
+    parser.add_argument(
+        "--ema-decay",
+        type=float,
+        default=None,
+        help="EMA decay factor for trainable floating-point parameters.",
+    )
+    parser.add_argument(
         "--valid-ratio",
         type=float,
         default=0.0,
@@ -1929,6 +2123,10 @@ def main() -> None:
         train_cfg = replace(train_cfg, save_every=args.save_every)
     if cli_provided(raw_argv, "--checkpoint-best-n"):
         train_cfg = replace(train_cfg, checkpoint_best_n=args.checkpoint_best_n)
+    if args.ema_enabled is not None:
+        train_cfg = replace(train_cfg, ema_enabled=bool(args.ema_enabled))
+    if cli_provided(raw_argv, "--ema-decay"):
+        train_cfg = replace(train_cfg, ema_decay=args.ema_decay)
     if cli_provided(raw_argv, "--valid-ratio"):
         train_cfg = replace(train_cfg, valid_ratio=args.valid_ratio)
     if cli_provided(raw_argv, "--valid-every"):
@@ -2052,6 +2250,8 @@ def main() -> None:
         print("warning: valid_every is set but valid_ratio=0. Validation is disabled.")
     if train_cfg.checkpoint_best_n < 0:
         raise ValueError(f"checkpoint_best_n must be >= 0, got {train_cfg.checkpoint_best_n}")
+    if not (0.0 <= train_cfg.ema_decay < 1.0):
+        raise ValueError(f"ema_decay must be in [0, 1), got {train_cfg.ema_decay}")
     if train_cfg.wandb_mode not in WANDB_MODES:
         raise ValueError(
             f"wandb_mode must be one of {sorted(WANDB_MODES)}, got {train_cfg.wandb_mode!r}"
@@ -2536,6 +2736,42 @@ def main() -> None:
         if is_main_process:
             print(f"Resumed from step={step}")
 
+    ema: ModelEMA | None = None
+    if train_cfg.ema_enabled:
+        ema = ModelEMA(raw_model, decay=train_cfg.ema_decay)
+        ema_restored = False
+        if args.resume is not None and resume_path is not None:
+            ema_path = _ema_checkpoint_path(resume_path)
+            if train_config_uses_lora(train_cfg):
+                if ema_path.exists() and is_main_process:
+                    print(
+                        "warning: EMA state restore for LoRA resumes is not supported; "
+                        "initializing EMA from resumed adapter weights."
+                    )
+            elif ema_path.is_file():
+                ema_ckpt = _load_checkpoint_payload(ema_path, map_location=device)
+                ema_model_state = ema_ckpt.get("model")
+                if not isinstance(ema_model_state, dict):
+                    raise ValueError(f"EMA checkpoint missing model weights dictionary: {ema_path}")
+                ema.load_model_state_dict(ema_model_state)
+                ema_updates = ema_ckpt.get("ema_num_updates")
+                if isinstance(ema_updates, int):
+                    ema.num_updates = int(ema_updates)
+                ema_restored = True
+                if is_main_process:
+                    print(f"Restored EMA weights from: {ema_path}")
+            elif is_main_process:
+                print(
+                    "warning: EMA is enabled for resume, but paired EMA checkpoint was not found; "
+                    "initializing EMA from the resumed model weights."
+                )
+        if is_main_process:
+            tracked = sum(int(tensor.numel()) for tensor in ema.shadow.values())
+            status = "restored" if ema_restored else "initialized"
+            print(
+                f"EMA enabled: decay={train_cfg.ema_decay} tracked_params={tracked:,} ({status})."
+            )
+
     progress = TrainProgress(
         max_steps=train_cfg.max_steps,
         start_step=step,
@@ -2712,6 +2948,8 @@ def main() -> None:
 
                 torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.grad_clip_norm)
                 optimizer.step()
+                if ema is not None:
+                    ema.update(raw_model)
                 optimizer.zero_grad(set_to_none=True)
                 if scheduler is not None:
                     scheduler.step()
@@ -2752,15 +2990,16 @@ def main() -> None:
                             wandb_run.log(metrics, step=step)
 
                 if step % train_cfg.save_every == 0 and is_main_process:
-                    save_checkpoint(
+                    save_checkpoint_pair(
                         _periodic_checkpoint_path(output_dir, step, train_cfg),
-                        raw_model,
-                        optimizer,
-                        scheduler,
-                        step,
-                        model_cfg,
-                        train_cfg,
+                        model=raw_model,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        step=step,
+                        model_cfg=model_cfg,
+                        train_cfg=train_cfg,
                         base_init=base_init,
+                        ema=ema,
                     )
                     enforce_periodic_checkpoint_limit(
                         output_dir=output_dir,
@@ -2773,14 +3012,15 @@ def main() -> None:
                     and step % train_cfg.valid_every == 0
                 ):
                     optimizer_set_train_mode(optimizer, False)
-                    valid_metrics = run_validation(
-                        model=model,
-                        loader=valid_loader,
-                        train_cfg=train_cfg,
-                        device=device,
-                        use_bf16=use_bf16,
-                        distributed=distributed,
-                    )
+                    with _validation_model_context(ema, raw_model):
+                        valid_metrics = run_validation(
+                            model=model,
+                            loader=valid_loader,
+                            train_cfg=train_cfg,
+                            device=device,
+                            use_bf16=use_bf16,
+                            distributed=distributed,
+                        )
                     optimizer_set_train_mode(optimizer, True)
                     if is_main_process:
                         progress.write(
@@ -2811,6 +3051,7 @@ def main() -> None:
                             model_cfg=model_cfg,
                             train_cfg=train_cfg,
                             base_init=base_init,
+                            ema=ema,
                         )
                         if best_path is not None:
                             progress.write(
@@ -2841,6 +3082,23 @@ def main() -> None:
                         character_image_transform=character_image_transform,
                         wandb_run=wandb_run,
                     )
+                    if ema is not None:
+                        with ema.apply_to(raw_model):
+                            run_preview(
+                                model=raw_model,
+                                model_cfg=model_cfg,
+                                train_cfg=train_cfg,
+                                samples=parsed_previews,
+                                codec=preview_codec,
+                                device=device,
+                                use_bf16=use_bf16,
+                                step=step,
+                                tokenizer=tokenizer,
+                                caption_tokenizer=caption_tokenizer,
+                                character_image_transform=character_image_transform,
+                                wandb_run=wandb_run,
+                                log_prefix="preview_ema",
+                            )
                     optimizer_set_train_mode(optimizer, True)
 
                 if step >= train_cfg.max_steps:
@@ -2852,14 +3110,15 @@ def main() -> None:
             and step % train_cfg.valid_every != 0
         ):
             optimizer_set_train_mode(optimizer, False)
-            valid_metrics = run_validation(
-                model=model,
-                loader=valid_loader,
-                train_cfg=train_cfg,
-                device=device,
-                use_bf16=use_bf16,
-                distributed=distributed,
-            )
+            with _validation_model_context(ema, raw_model):
+                valid_metrics = run_validation(
+                    model=model,
+                    loader=valid_loader,
+                    train_cfg=train_cfg,
+                    device=device,
+                    use_bf16=use_bf16,
+                    distributed=distributed,
+                )
             optimizer_set_train_mode(optimizer, True)
             if is_main_process:
                 progress.write(
@@ -2890,6 +3149,7 @@ def main() -> None:
                     model_cfg=model_cfg,
                     train_cfg=train_cfg,
                     base_init=base_init,
+                    ema=ema,
                 )
                 if best_path is not None:
                     progress.write(
@@ -2900,15 +3160,16 @@ def main() -> None:
                     )
 
         if is_main_process:
-            save_checkpoint(
+            save_checkpoint_pair(
                 _final_checkpoint_path(output_dir, train_cfg),
-                raw_model,
-                optimizer,
-                scheduler,
-                step,
-                model_cfg,
-                train_cfg,
+                model=raw_model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                step=step,
+                model_cfg=model_cfg,
+                train_cfg=train_cfg,
                 base_init=base_init,
+                ema=ema,
             )
             if wandb_run is not None:
                 wandb_run.summary["train/final_step"] = step

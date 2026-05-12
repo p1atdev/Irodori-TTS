@@ -162,6 +162,8 @@ class TrainConfig:
     log_every: int = 100
     save_every: int = 1000
     checkpoint_best_n: int = 0
+    ema_enabled: bool = False
+    ema_decay: float = 0.9999
     valid_ratio: float = 0.0
     valid_every: int = 0
     progress: bool = True

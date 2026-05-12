@@ -360,6 +360,8 @@ uv run python train.py \
 | `--save-every` | `1000` | チェックポイントの保存間隔（ステップ） |
 | `--log-every` | `100` | ログの出力間隔（ステップ） |
 | `--checkpoint-best-n` | `0`（全保存） | 検証スコアが良い上位 N 件のみ保持 |
+| `--ema` | False | EMA を有効化し、通常版と EMA 版の preview/checkpoint を両方出力 |
+| `--ema-decay` | `0.9999` | EMA の decay |
 | `--valid-ratio` | `0.0` | 検証データの割合 |
 | `--valid-every` | `0` | 検証の実施間隔（ステップ） |
 | `--wandb` | False | Weights & Biases ロギングを有効化 |
