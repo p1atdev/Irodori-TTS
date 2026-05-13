@@ -168,6 +168,43 @@ def test_base_model_forward_runs_without_error() -> None:
     assert torch.isfinite(out).all()
 
 
+def test_inference_rope_cache_does_not_poison_training_backward() -> None:
+    cfg = make_base_config()
+    model = TextToLatentRFDiT(cfg)
+
+    with torch.inference_mode():
+        freqs = model._rope_freqs(8, torch.device("cpu"))
+
+    assert freqs.shape[0] == 8
+    assert model._freqs_cis_cache.numel() == 0
+
+    batch_size = 2
+    seq_len = 4
+    text_len = 6
+    ref_len = 3
+
+    x_t = torch.randn(batch_size, seq_len, cfg.patched_latent_dim)
+    t = torch.rand(batch_size)
+    text_input_ids = torch.randint(0, cfg.text_vocab_size, (batch_size, text_len))
+    text_mask = torch.ones(batch_size, text_len, dtype=torch.bool)
+    speaker_latent = torch.randn(batch_size, ref_len, cfg.patched_latent_dim)
+    speaker_mask = torch.ones(batch_size, ref_len, dtype=torch.bool)
+    latent_mask = torch.ones(batch_size, seq_len, dtype=torch.bool)
+
+    out = model(
+        x_t=x_t,
+        t=t,
+        text_input_ids=text_input_ids,
+        text_mask=text_mask,
+        speaker_latent=speaker_latent,
+        speaker_mask=speaker_mask,
+        latent_mask=latent_mask,
+    )
+    out.square().mean().backward()
+
+    assert not bool(getattr(model._freqs_cis_cache, "is_inference", lambda: False)())
+
+
 def test_character_model_forward_runs_without_error(monkeypatch) -> None:
     patch_character_backbone(monkeypatch)
     cfg = make_character_config()
@@ -237,6 +274,66 @@ def test_character_duration_predictor_uses_null_speaker_without_reference(monkey
 
     assert out.shape == (batch_size,)
     assert torch.isfinite(out).all()
+
+
+def test_character_duration_predictor_receives_character_state(monkeypatch) -> None:
+    patch_character_backbone(monkeypatch)
+    cfg = make_character_config()
+    cfg.use_duration_predictor = True
+    cfg.duration_hidden_dim = 16
+    cfg.duration_layers = 1
+    cfg.duration_dropout = 0.0
+    cfg.duration_architecture = "token_sum_adarn_zero_no_aux"
+    cfg.duration_speaker_fusion = "adarn_zero"
+    model = TextToLatentRFDiT(cfg)
+
+    assert model.duration_predictor is not None
+    original_forward = model.duration_predictor.forward
+    captured: dict[str, torch.Tensor | None] = {}
+
+    def capture_forward(**kwargs):
+        captured["speaker_state"] = kwargs["speaker_state"]
+        captured["speaker_mask"] = kwargs["speaker_mask"]
+        captured["has_speaker"] = kwargs["has_speaker"]
+        return original_forward(**kwargs)
+
+    monkeypatch.setattr(model.duration_predictor, "forward", capture_forward)
+
+    batch_size = 2
+    text_len = 6
+    character_tokens = 3
+    text_state = torch.randn(batch_size, text_len, cfg.text_dim)
+    text_mask = torch.ones(batch_size, text_len, dtype=torch.bool)
+    character_state = torch.randn(batch_size, character_tokens, cfg.speaker_dim)
+    character_mask = torch.tensor(
+        [
+            [True, True, False],
+            [False, False, False],
+        ],
+        dtype=torch.bool,
+    )
+    duration_features = torch.zeros(batch_size, cfg.duration_aux_dim)
+
+    out = model.predict_duration_log_frames(
+        text_state=text_state,
+        text_mask=text_mask,
+        speaker_state=None,
+        speaker_mask=None,
+        character_state=character_state,
+        character_mask=character_mask,
+        duration_features=duration_features,
+        has_speaker=None,
+    )
+
+    expected_state, expected_mask = model._prepend_masked_mean_token(
+        character_state,
+        character_mask,
+    )
+    assert out.shape == (batch_size,)
+    assert torch.isfinite(out).all()
+    assert torch.allclose(captured["speaker_state"], expected_state)
+    assert torch.equal(captured["speaker_mask"], expected_mask)
+    assert torch.equal(captured["has_speaker"], torch.tensor([True, False]))
 
 
 def test_character_model_sampling_runs_without_error(monkeypatch) -> None:

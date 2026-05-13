@@ -88,19 +88,6 @@ def test_preview_sample_to_sampling_request_allows_trim_tail_false() -> None:
     assert request.trim_tail is False
 
 
-def test_parse_preview_samples_accepts_legacy_trim_trail_alias() -> None:
-    samples = train.parse_preview_samples(
-        [
-            {
-                "text": "テスト",
-                "trim_trail": False,
-            }
-        ]
-    )
-
-    assert samples[0].trim_tail is False
-
-
 def test_run_preview_delegates_to_shared_core_and_logs_audio(monkeypatch) -> None:
     model_cfg = ModelConfig(
         latent_dim=2,

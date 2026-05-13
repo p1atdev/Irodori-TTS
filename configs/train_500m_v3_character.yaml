@@ -92,8 +92,13 @@ train:
   # 
   timestep_stratified: true # true/false
   max_latent_steps: 750
-  fixed_target_latent_steps: 750
-  fixed_target_full_mask: true
+  fixed_target_latent_steps: # null for v3
+  fixed_target_full_mask: false
+  # 
+  rf_loss_mode: utterance_mean
+  duration_loss_weight: 0.1
+  duration_speaker_dropout: 0.0
+  duration_huber_delta: 0.1
   # 
   log_every: 10
   save_every: 500

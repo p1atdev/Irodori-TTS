@@ -1551,13 +1551,6 @@ def parse_preview_samples(preview_samples: list | None) -> list[PreviewSampleCon
                 f"got {type(sample)!r} at index {idx}."
             )
         sample = dict(sample)
-        if "trim_trail" in sample:
-            if "trim_tail" in sample and sample["trim_tail"] != sample["trim_trail"]:
-                raise ValueError(
-                    "preview_samples entries cannot set both 'trim_tail' and "
-                    f"legacy 'trim_trail' to different values at index {idx}."
-                )
-            sample["trim_tail"] = sample.pop("trim_trail")
         parsed.append(PreviewSampleConfig(**sample))
     return parsed
 
@@ -1767,6 +1760,7 @@ def run_validation(
                 caption_ids = batch["caption_ids"].to(device, non_blocking=True)
                 caption_mask = batch["caption_mask"].to(device, non_blocking=True)
             character_images_val = None
+            has_image_val = None
             if model_cfg.use_character_condition:
                 character_images_val = batch["character_images"].to(device, non_blocking=True)
                 has_image_val = batch["has_image"].to(device, non_blocking=True)
@@ -1829,6 +1823,16 @@ def run_validation(
             else:
                 speaker_condition_dropout = None
                 duration_has_speaker = None
+                if model_cfg.use_character_condition:
+                    if has_image_val is None:
+                        raise RuntimeError(
+                            "Character conditioning is enabled but has_image is missing."
+                        )
+                    duration_has_speaker = has_image_val
+                    duration_features = set_duration_has_speaker_feature(
+                        duration_features,
+                        duration_has_speaker,
+                    )
 
             with (
                 torch.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -3267,6 +3271,7 @@ def main() -> None:
                         caption_mask = caption_mask & use_caption[:, None]
 
                 character_cond_drop = None
+                use_image = None
                 if raw_model.cfg.use_character_condition:
                     if has_image is None or character_images is None:
                         raise RuntimeError(
@@ -3300,6 +3305,16 @@ def main() -> None:
                     if not raw_model.cfg.use_duration_predictor:
                         ref_mask = ref_mask & use_speaker[:, None]
                         ref_latent = ref_latent * use_speaker[:, None, None].to(ref_latent.dtype)
+                elif raw_model.cfg.use_character_condition:
+                    if use_image is None:
+                        raise RuntimeError(
+                            "Character conditioning is enabled but use_image was not computed."
+                        )
+                    duration_has_speaker = use_image
+                    duration_features = set_duration_has_speaker_feature(
+                        duration_features,
+                        duration_has_speaker,
+                    )
 
                 should_step = (accum_micro_steps % accum_steps) == 0
                 sync_context = model.no_sync() if distributed and not should_step else nullcontext()

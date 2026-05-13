@@ -630,24 +630,36 @@ def generate_from_components(
             _log(duration_msg)
         elif model_cfg.use_duration_predictor:
             t0 = measure_start(model_device)
-            has_speaker_duration = torch.zeros((batch_size,), dtype=torch.bool, device=model_device)
+            has_duration_reference = torch.zeros(
+                (batch_size,), dtype=torch.bool, device=model_device
+            )
             if model_cfg.use_speaker_condition and ref_mask is not None:
-                has_speaker_duration = ref_mask.any(dim=1)
+                has_duration_reference = ref_mask.any(dim=1)
+            elif model_cfg.use_character_condition:
+                has_character_reference = (
+                    request.character_image is not None and str(request.character_image).strip()
+                )
+                has_duration_reference = torch.full(
+                    (batch_size,),
+                    bool(has_character_reference),
+                    dtype=torch.bool,
+                    device=model_device,
+                )
             duration_features = build_duration_features(
                 [normalized_text] * batch_size,
                 token_counts=text_mask.sum(dim=1),
                 max_text_len=int(text_mask.shape[1]),
-                has_speaker=has_speaker_duration,
+                has_speaker=has_duration_reference,
             ).to(model_device)
             (
                 duration_text_state,
                 duration_text_mask,
                 duration_speaker_state,
-                _duration_speaker_mask,
+                duration_speaker_mask,
                 _duration_caption_state,
                 _duration_caption_mask,
-                _duration_character_state,
-                _duration_character_mask,
+                duration_character_state,
+                duration_character_mask,
                 _duration_character_noisy_state,
             ) = model.encode_conditions(
                 text_input_ids=text_ids,
@@ -662,9 +674,11 @@ def generate_from_components(
                 text_state=duration_text_state,
                 text_mask=duration_text_mask,
                 speaker_state=duration_speaker_state,
-                speaker_mask=_duration_speaker_mask,
+                speaker_mask=duration_speaker_mask,
+                character_state=duration_character_state,
+                character_mask=duration_character_mask,
                 duration_features=duration_features,
-                has_speaker=has_speaker_duration,
+                has_speaker=has_duration_reference,
             )
             pred_frames = torch.expm1(pred_log_frames).float().mean().item()
             scaled_frames = pred_frames * duration_scale

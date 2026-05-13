@@ -29,6 +29,24 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Te
     return torch.complex(torch.cos(freqs), torch.sin(freqs))
 
 
+def cached_rope_freqs(
+    module: nn.Module,
+    *,
+    cache_name: str,
+    head_dim: int,
+    seq_len: int,
+    device: torch.device,
+) -> torch.Tensor:
+    cache = getattr(module, cache_name)
+    is_inference_cache = bool(getattr(cache, "is_inference", lambda: False)())
+    needs_refresh = cache.device != device or cache.shape[0] < seq_len or is_inference_cache
+    if needs_refresh:
+        cache = precompute_freqs_cis(head_dim, seq_len).to(device)
+        if not torch.is_inference_mode_enabled():
+            setattr(module, cache_name, cache)
+    return cache[:seq_len]
+
+
 def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     # x: (B, S, H, Dh), Dh must be even.
     x_ = torch.view_as_complex(x.float().reshape(*x.shape[:3], -1, 2))
@@ -726,11 +744,13 @@ class TextEncoder(nn.Module):
         )
 
     def _rope_freqs(self, seq_len: int, device: torch.device) -> torch.Tensor:
-        cache = self._freqs_cis_cache
-        if cache.device != device or cache.shape[0] < seq_len:
-            cache = precompute_freqs_cis(self.head_dim, seq_len).to(device)
-            self._freqs_cis_cache = cache
-        return cache[:seq_len]
+        return cached_rope_freqs(
+            self,
+            cache_name="_freqs_cis_cache",
+            head_dim=self.head_dim,
+            seq_len=seq_len,
+            device=device,
+        )
 
     def forward(self, input_ids: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         x = self.text_embedding(input_ids)
@@ -781,11 +801,13 @@ class ReferenceLatentEncoder(nn.Module):
         )
 
     def _rope_freqs(self, seq_len: int, device: torch.device) -> torch.Tensor:
-        cache = self._freqs_cis_cache
-        if cache.device != device or cache.shape[0] < seq_len:
-            cache = precompute_freqs_cis(self.head_dim, seq_len).to(device)
-            self._freqs_cis_cache = cache
-        return cache[:seq_len]
+        return cached_rope_freqs(
+            self,
+            cache_name="_freqs_cis_cache",
+            head_dim=self.head_dim,
+            seq_len=seq_len,
+            device=device,
+        )
 
     def forward(self, latent: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         x = self.in_proj(latent)
@@ -1342,11 +1364,13 @@ class TextToLatentRFDiT(nn.Module):
         self.gradient_checkpointing = bool(enabled)
 
     def _rope_freqs(self, seq_len: int, device: torch.device) -> torch.Tensor:
-        cache = self._freqs_cis_cache
-        if cache.device != device or cache.shape[0] < seq_len:
-            cache = precompute_freqs_cis(self.head_dim, seq_len).to(device)
-            self._freqs_cis_cache = cache
-        return cache[:seq_len]
+        return cached_rope_freqs(
+            self,
+            cache_name="_freqs_cis_cache",
+            head_dim=self.head_dim,
+            seq_len=seq_len,
+            device=device,
+        )
 
     @staticmethod
     def _prepend_masked_mean_token(
@@ -1587,6 +1611,8 @@ class TextToLatentRFDiT(nn.Module):
                     text_mask=text_mask_full,
                     speaker_state=speaker_state,
                     speaker_mask=speaker_mask_full,
+                    character_state=character_state,
+                    character_mask=character_mask_full,
                     duration_features=duration_features,
                     has_speaker=duration_has_speaker,
                 )
@@ -1628,6 +1654,8 @@ class TextToLatentRFDiT(nn.Module):
                 text_mask=text_mask_full,
                 speaker_state=speaker_state,
                 speaker_mask=speaker_mask_full,
+                character_state=character_state,
+                character_mask=character_mask_full,
                 duration_features=duration_features,
                 has_speaker=duration_has_speaker,
             )
@@ -1712,6 +1740,8 @@ class TextToLatentRFDiT(nn.Module):
         speaker_mask: torch.Tensor | None,
         duration_features: torch.Tensor,
         has_speaker: torch.Tensor | None,
+        character_state: torch.Tensor | None = None,
+        character_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.duration_predictor is None:
             raise RuntimeError("Duration predictor is disabled for this model.")
@@ -1725,7 +1755,34 @@ class TextToLatentRFDiT(nn.Module):
                 f"expected {self.cfg.duration_aux_dim}, got {duration_features.shape[1]}"
             )
 
+        duration_state = speaker_state
+        duration_mask = speaker_mask
         duration_has_speaker = has_speaker
+        if self.cfg.use_character_condition and character_state is not None:
+            if character_state.ndim != 3:
+                raise ValueError(
+                    f"character_state must have shape (B, S, D), got {tuple(character_state.shape)}"
+                )
+            if (
+                self.duration_predictor.speaker_dim is not None
+                and character_state.shape[-1] != self.duration_predictor.speaker_dim
+            ):
+                raise ValueError(
+                    "character_state last dim must match duration predictor speaker_dim "
+                    f"({self.duration_predictor.speaker_dim}), got {character_state.shape[-1]}"
+                )
+            if character_mask is None:
+                character_mask = torch.ones(
+                    character_state.shape[:2],
+                    dtype=torch.bool,
+                    device=character_state.device,
+                )
+            duration_state, duration_mask = self._prepend_masked_mean_token(
+                character_state,
+                character_mask,
+            )
+            if duration_has_speaker is None and self.duration_predictor.speaker_dim is not None:
+                duration_has_speaker = duration_mask[:, 0]
         if duration_has_speaker is None and self.duration_predictor.speaker_dim is not None:
             duration_has_speaker = torch.zeros(
                 (text_state.shape[0],),
@@ -1737,8 +1794,8 @@ class TextToLatentRFDiT(nn.Module):
             text_state=text_state.detach(),
             text_mask=text_mask,
             aux_features=duration_features,
-            speaker_state=None if speaker_state is None else speaker_state.detach(),
-            speaker_mask=speaker_mask,
+            speaker_state=None if duration_state is None else duration_state.detach(),
+            speaker_mask=duration_mask,
             has_speaker=duration_has_speaker,
         )
         return pred.float()
