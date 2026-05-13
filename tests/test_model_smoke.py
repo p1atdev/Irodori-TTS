@@ -11,8 +11,8 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import irodori_tts.image_encoder as image_encoder
 from irodori_tts.config import ModelConfig
-from irodori_tts.projector import MLPProjectorConfig
 from irodori_tts.model import TextToLatentRFDiT
+from irodori_tts.projector import MLPProjectorConfig
 from irodori_tts.rf import sample_euler_rf_cfg
 
 
@@ -202,6 +202,40 @@ def test_character_model_forward_runs_without_error(monkeypatch) -> None:
 
     assert out.shape == x_t.shape
     assert out.dtype == x_t.dtype
+    assert torch.isfinite(out).all()
+
+
+def test_character_duration_predictor_uses_null_speaker_without_reference(monkeypatch) -> None:
+    patch_character_backbone(monkeypatch)
+    cfg = make_character_config()
+    cfg.use_duration_predictor = True
+    cfg.duration_hidden_dim = 16
+    cfg.duration_layers = 1
+    cfg.duration_dropout = 0.0
+    cfg.duration_architecture = "token_sum_adarn_zero_no_aux"
+    cfg.duration_speaker_fusion = "adarn_zero"
+    model = TextToLatentRFDiT(cfg)
+
+    assert not cfg.use_speaker_condition
+    assert model.duration_predictor is not None
+    assert model.duration_predictor.speaker_dim == cfg.speaker_dim
+
+    batch_size = 2
+    text_len = 6
+    text_state = torch.randn(batch_size, text_len, cfg.text_dim)
+    text_mask = torch.ones(batch_size, text_len, dtype=torch.bool)
+    duration_features = torch.zeros(batch_size, cfg.duration_aux_dim)
+
+    out = model.predict_duration_log_frames(
+        text_state=text_state,
+        text_mask=text_mask,
+        speaker_state=None,
+        speaker_mask=None,
+        duration_features=duration_features,
+        has_speaker=None,
+    )
+
+    assert out.shape == (batch_size,)
     assert torch.isfinite(out).all()
 
 

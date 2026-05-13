@@ -1273,9 +1273,14 @@ class TextToLatentRFDiT(nn.Module):
 
         self.duration_predictor = None
         if cfg.use_duration_predictor:
-            duration_speaker_dim = None
-            if cfg.use_speaker_condition:
-                duration_speaker_dim = int(cfg.speaker_dim)
+            duration_architecture = str(cfg.duration_architecture).strip().lower()
+            duration_speaker_fusion = str(cfg.duration_speaker_fusion).strip().lower()
+            duration_uses_speaker = (
+                cfg.use_speaker_condition
+                or duration_speaker_fusion != "concat"
+                or duration_architecture == "token_sum_adarn_zero_no_aux"
+            )
+            duration_speaker_dim = int(cfg.speaker_dim) if duration_uses_speaker else None
             self.duration_predictor = DurationPredictor(
                 text_dim=cfg.text_dim,
                 aux_dim=cfg.duration_aux_dim,
@@ -1720,13 +1725,21 @@ class TextToLatentRFDiT(nn.Module):
                 f"expected {self.cfg.duration_aux_dim}, got {duration_features.shape[1]}"
             )
 
+        duration_has_speaker = has_speaker
+        if duration_has_speaker is None and self.duration_predictor.speaker_dim is not None:
+            duration_has_speaker = torch.zeros(
+                (text_state.shape[0],),
+                dtype=torch.bool,
+                device=text_state.device,
+            )
+
         pred = self.duration_predictor(
             text_state=text_state.detach(),
             text_mask=text_mask,
             aux_features=duration_features,
             speaker_state=None if speaker_state is None else speaker_state.detach(),
             speaker_mask=speaker_mask,
-            has_speaker=has_speaker,
+            has_speaker=duration_has_speaker,
         )
         return pred.float()
 
