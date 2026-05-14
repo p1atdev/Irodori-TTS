@@ -53,9 +53,9 @@ class PerceiverAttention(nn.Module):
         batch_size, seq_len, _ = tensor.shape
         return tensor.view(batch_size, seq_len, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
 
-    # def _post_attn_reshape(self, tensor: torch.Tensor) -> torch.Tensor:
-    #     batch_size, _num_heads, seq_len, _head_dim = tensor.shape
-    #     return tensor.permute(0, 2, 1, 3).reshape(batch_size, seq_len, self.in_features)
+    def _post_attn_reshape(self, tensor: torch.Tensor) -> torch.Tensor:
+        batch_size, _num_heads, seq_len, _head_dim = tensor.shape
+        return tensor.permute(0, 2, 1, 3).reshape(batch_size, seq_len, self.in_features)
 
     def forward(self, image_features: torch.Tensor, latents: torch.Tensor) -> torch.Tensor:
         image_features = self.norm1(image_features)
@@ -76,17 +76,11 @@ class PerceiverAttention(nn.Module):
 
         attn = F.scaled_dot_product_attention(query, key, value, is_causal=False)
 
-        batch_size, num_query_tokens, _ = latents.shape
         attn = attn.permute(0, 2, 1, 3).contiguous()
+        attn = self._post_attn_reshape(attn)
         if self.is_gated:
-            gate = self.to_gate(latents).reshape(
-                batch_size,
-                num_query_tokens,
-                self.num_heads,
-                self.head_dim,
-            )
+            gate = self.to_gate(latents)
             attn = attn * torch.sigmoid(gate)
-        attn = attn.view(batch_size, num_query_tokens, self.in_features)
 
         return self.to_out(attn)
 
