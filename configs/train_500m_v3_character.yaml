@@ -19,6 +19,8 @@ model:
   character_hidden_state_index: -5
   character_dim: 768
   character_use_all_patches: true
+  character_prepend_global_summary_token: false
+  character_projector_split_duration_state: false
   character_image_size: 448
   # character_image_size: 512 # siglip2
   character_attention_mode: joint  # joint or cross
@@ -124,6 +126,8 @@ train:
     - text: その森には、古い言い伝えがありました。月が最も高く昇る夜、静かに耳を澄ませば、風の歌声が聞こえるというのです。
       image_path: data/sample/sample-01.webp
       num_steps: 20
+      use_duration_predictor: true
+      duration_scale: 1.0
       seconds: 20.0
       cfg_guidance_mode: independent # joint, alternating
       cfg_scale_text: 3.0
@@ -132,6 +136,8 @@ train:
     - text: その森には、古い言い伝えがありました。月が最も高く昇る夜、静かに耳を澄ませば、風の歌声が聞こえるというのです。
       image_path: data/sample/sample-02.webp
       num_steps: 20
+      use_duration_predictor: true
+      duration_scale: 1.0
       seconds: 20.0
       cfg_guidance_mode: independent
       cfg_scale_text: 3.0
@@ -140,6 +146,8 @@ train:
     - text: その森には、古い言い伝えがありました。月が最も高く昇る夜、静かに耳を澄ませば、風の歌声が聞こえるというのです。
       image_path: data/sample/sample-05.webp
       num_steps: 20
+      use_duration_predictor: true
+      duration_scale: 1.0
       seconds: 20.0
       cfg_guidance_mode: independent
       cfg_scale_text: 3.0
@@ -148,6 +156,8 @@ train:
     - text: その森には、古い言い伝えがありました。月が最も高く昇る夜、静かに耳を澄ませば、風の歌声が聞こえるというのです。
       image_path: data/sample/sample-06.webp
       num_steps: 20
+      use_duration_predictor: true
+      duration_scale: 1.0
       seconds: 20.0
       cfg_guidance_mode: independent
       cfg_scale_text: 3.0
@@ -156,6 +166,8 @@ train:
     - text: その森には、古い言い伝えがありました。月が最も高く昇る夜、静かに耳を澄ませば、風の歌声が聞こえるというのです。
       image_path: data/sample/sample-03.webp
       num_steps: 20
+      use_duration_predictor: true
+      duration_scale: 1.0
       seconds: 20.0
       cfg_guidance_mode: independent # joint, alternating
       cfg_scale_text: 3.0
@@ -164,6 +176,8 @@ train:
     - text: その森には、古い言い伝えがありました。月が最も高く昇る夜、静かに耳を澄ませば、風の歌声が聞こえるというのです。
       image_path: data/sample/sample-04.webp
       num_steps: 20
+      use_duration_predictor: true
+      duration_scale: 1.0
       seconds: 20.0
       cfg_guidance_mode: independent
       cfg_scale_text: 3.0
@@ -172,6 +186,8 @@ train:
     - text: その森には、古い言い伝えがありました。月が最も高く昇る夜、静かに耳を澄ませば、風の歌声が聞こえるというのです。
       image_path: data/sample/sample-07.webp
       num_steps: 20
+      use_duration_predictor: true
+      duration_scale: 1.0
       seconds: 20.0
       cfg_guidance_mode: independent
       cfg_scale_text: 3.0
@@ -180,6 +196,8 @@ train:
     - text: その森には、古い言い伝えがありました。月が最も高く昇る夜、静かに耳を澄ませば、風の歌声が聞こえるというのです。
       image_path: data/sample/sample-08.webp
       num_steps: 20
+      use_duration_predictor: true
+      duration_scale: 1.0
       seconds: 20.0
       cfg_guidance_mode: independent
       cfg_scale_text: 3.0

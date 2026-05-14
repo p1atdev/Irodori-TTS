@@ -76,8 +76,24 @@ def test_preview_sample_to_sampling_request_uses_normalized_text_for_length_esti
     assert request.text == "　（テスト？）\t"
     assert request.caption == "  cap  "
     assert request.seconds == 2.0
+    assert request.duration_scale == 1.0
     assert request.seed == 123
     assert request.trim_tail is True
+
+
+def test_preview_sample_to_sampling_request_can_use_duration_predictor() -> None:
+    request, normalized_text = train.preview_sample_to_sampling_request(
+        train.PreviewSampleConfig(
+            text="　（テスト？）\t",
+            seconds=20.0,
+            use_duration_predictor=True,
+            duration_scale=1.25,
+        )
+    )
+
+    assert normalized_text == "テスト?"
+    assert request.seconds is None
+    assert request.duration_scale == 1.25
 
 
 def test_preview_sample_to_sampling_request_allows_trim_tail_false() -> None:

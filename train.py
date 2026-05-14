@@ -815,6 +815,16 @@ def _check_model_config_compatibility(
                     current_model_cfg.character_use_all_patches,
                 ),
                 (
+                    "character_prepend_global_summary_token",
+                    checkpoint_cfg.character_prepend_global_summary_token,
+                    current_model_cfg.character_prepend_global_summary_token,
+                ),
+                (
+                    "character_projector_split_duration_state",
+                    checkpoint_cfg.character_projector_split_duration_state,
+                    current_model_cfg.character_projector_split_duration_state,
+                ),
+                (
                     "character_image_size",
                     checkpoint_cfg.character_image_size,
                     current_model_cfg.character_image_size,
@@ -1520,7 +1530,10 @@ class PreviewSampleConfig:
     caption: str | None = None
     image_path: str | None = None
     ref_wav: str | None = None
-    seconds: float | None = None  # None → estimated from text length
+    # None -> text-length estimate unless duration predictor is enabled.
+    seconds: float | None = None
+    use_duration_predictor: bool = False
+    duration_scale: float = 1.0
     num_steps: int = 20
     cfg_scale_text: float = 3.0
     cfg_scale_caption: float = 3.0
@@ -1602,9 +1615,12 @@ def resolve_preview_sequence_lengths(
 def preview_sample_to_sampling_request(cfg: PreviewSampleConfig) -> tuple[SamplingRequest, str]:
     """Convert preview config to the shared sampling request model."""
     normalized_text = normalize_preview_text(cfg.text)
-    seconds = cfg.seconds
-    if seconds is None:
-        seconds = max(2.0, len(normalized_text) / 5.0 + 1.0)
+    request_seconds = None
+    if not bool(cfg.use_duration_predictor):
+        seconds = cfg.seconds
+        if seconds is None:
+            seconds = max(2.0, len(normalized_text) / 5.0 + 1.0)
+        request_seconds = float(seconds)
     return (
         SamplingRequest(
             text=str(cfg.text),
@@ -1616,7 +1632,8 @@ def preview_sample_to_sampling_request(cfg: PreviewSampleConfig) -> tuple[Sampli
             ref_ensure_max=True,
             num_candidates=1,
             decode_mode="sequential",
-            seconds=float(seconds),
+            seconds=request_seconds,
+            duration_scale=float(cfg.duration_scale),
             max_ref_seconds=None,
             max_text_len=None,
             max_caption_len=None,

@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as _torch_checkpoint
 
 from .config import ModelConfig
-from .image_encoder import CharacterImageEncoder
+from .image_encoder import CharacterImageEncoder, CharacterImageEncoderOutput
 
 DURATION_SPEAKER_FUSIONS = {
     "concat",
@@ -898,6 +898,7 @@ class EncodedConditions(NamedTuple):
     caption_mask: torch.Tensor | None
     character_state: torch.Tensor | None
     character_mask: torch.Tensor | None
+    character_duration_state: torch.Tensor | None
     character_noisy_state: torch.Tensor | None
 
 
@@ -1331,6 +1332,8 @@ class TextToLatentRFDiT(nn.Module):
                 image_size=cfg.character_image_size,
                 projector_config=cfg.character_projector_resolved,
                 hidden_state_index=cfg.character_hidden_state_index,
+                prepend_global_summary_token=cfg.character_prepend_global_summary_token,
+                split_duration_state=cfg.character_projector_split_duration_state,
             )
 
         # timestep embedder
@@ -1454,6 +1457,7 @@ class TextToLatentRFDiT(nn.Module):
             caption_state = self.caption_norm(caption_state)
 
         character_state = None
+        character_duration_state = None
         character_noisy_state = None
         if self.cfg.use_character_condition:
             if self.character_encoder is None:
@@ -1471,16 +1475,45 @@ class TextToLatentRFDiT(nn.Module):
                 if character_mask is not None:
                     character_mask = character_mask.clone()
                     character_mask[character_condition_dropout] = False
-            character_state = self.character_encoder(character_images)
+            character_encoded = self.character_encoder(character_images)
+            if isinstance(character_encoded, CharacterImageEncoderOutput):
+                character_state = character_encoded.generation_state
+                character_duration_state = character_encoded.duration_state
+            else:
+                character_state = character_encoded
+                character_duration_state = character_state
+            if character_duration_state.shape[:2] != character_state.shape[:2]:
+                raise ValueError(
+                    "character duration state must match generation state batch/token shape, "
+                    f"got generation={tuple(character_state.shape)} "
+                    f"duration={tuple(character_duration_state.shape)}"
+                )
             if character_mask is None:
                 character_mask = torch.ones(
                     character_state.shape[:2],
                     dtype=torch.bool,
                     device=character_state.device,
                 )
+            elif (
+                self.cfg.character_prepend_global_summary_token
+                and character_mask.ndim == 2
+                and character_mask.shape[0] == character_state.shape[0]
+                and character_mask.shape[1] == character_state.shape[1] - 1
+            ):
+                summary_mask = character_mask.any(dim=1, keepdim=True)
+                character_mask = torch.cat([summary_mask, character_mask], dim=1)
+            elif character_mask.shape[:2] != character_state.shape[:2]:
+                raise ValueError(
+                    "character_mask must match character_state shape after encoding, "
+                    f"got state={tuple(character_state.shape)} mask={tuple(character_mask.shape)}"
+                )
             character_noisy_state = None
             if use_character_noisy_condition:
-                character_noisy_state = self.character_encoder(torch.randn_like(character_images))
+                character_noisy_encoded = self.character_encoder(torch.randn_like(character_images))
+                if isinstance(character_noisy_encoded, CharacterImageEncoderOutput):
+                    character_noisy_state = character_noisy_encoded.generation_state
+                else:
+                    character_noisy_state = character_noisy_encoded
 
         return EncodedConditions(
             text_state,
@@ -1491,6 +1524,7 @@ class TextToLatentRFDiT(nn.Module):
             caption_mask,
             character_state,
             character_mask,
+            character_duration_state,
             character_noisy_state,
         )
 
@@ -1594,6 +1628,7 @@ class TextToLatentRFDiT(nn.Module):
                 caption_mask_full,
                 character_state,
                 character_mask_full,
+                character_duration_state,
                 _character_noisy_state,
             ) = self.encode_conditions(
                 text_input_ids=text_input_ids,
@@ -1611,7 +1646,7 @@ class TextToLatentRFDiT(nn.Module):
                     text_mask=text_mask_full,
                     speaker_state=speaker_state,
                     speaker_mask=speaker_mask_full,
-                    character_state=character_state,
+                    character_state=character_duration_state,
                     character_mask=character_mask_full,
                     duration_features=duration_features,
                     has_speaker=duration_has_speaker,
@@ -1654,7 +1689,7 @@ class TextToLatentRFDiT(nn.Module):
                 text_mask=text_mask_full,
                 speaker_state=speaker_state,
                 speaker_mask=speaker_mask_full,
-                character_state=character_state,
+                character_state=character_duration_state,
                 character_mask=character_mask_full,
                 duration_features=duration_features,
                 has_speaker=duration_has_speaker,
@@ -1675,6 +1710,7 @@ class TextToLatentRFDiT(nn.Module):
             caption_mask,
             character_state,
             character_mask,
+            _character_duration_state,
             _character_noisy_state,
         ) = self.encode_conditions(
             text_input_ids=text_input_ids,
@@ -1777,10 +1813,13 @@ class TextToLatentRFDiT(nn.Module):
                     dtype=torch.bool,
                     device=character_state.device,
                 )
-            duration_state, duration_mask = self._prepend_masked_mean_token(
-                character_state,
-                character_mask,
-            )
+            if self.cfg.character_prepend_global_summary_token:
+                duration_state, duration_mask = character_state, character_mask
+            else:
+                duration_state, duration_mask = self._prepend_masked_mean_token(
+                    character_state,
+                    character_mask,
+                )
             if duration_has_speaker is None and self.duration_predictor.speaker_dim is not None:
                 duration_has_speaker = duration_mask[:, 0]
         if duration_has_speaker is None and self.duration_predictor.speaker_dim is not None:

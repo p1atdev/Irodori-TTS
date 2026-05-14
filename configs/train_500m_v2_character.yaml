@@ -19,6 +19,8 @@ model:
   character_hidden_state_index: -5
   character_dim: 768
   character_use_all_patches: true
+  character_prepend_global_summary_token: false
+  character_projector_split_duration_state: false
   character_image_size: 448
   # character_image_size: 512 # siglip2
   character_attention_mode: joint  # joint or cross

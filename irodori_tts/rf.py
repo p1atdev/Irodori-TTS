@@ -220,6 +220,7 @@ def sample_euler_rf_cfg(
         caption_mask_cond,
         character_state_cond,
         character_mask_cond,
+        _character_duration_state_cond,
         character_noisy_state_cond,
     ) = model.encode_conditions(
         text_input_ids=text_input_ids,

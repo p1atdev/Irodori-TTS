@@ -660,6 +660,7 @@ def generate_from_components(
                 _duration_caption_mask,
                 duration_character_state,
                 duration_character_mask,
+                duration_character_duration_state,
                 _duration_character_noisy_state,
             ) = model.encode_conditions(
                 text_input_ids=text_ids,
@@ -675,7 +676,7 @@ def generate_from_components(
                 text_mask=duration_text_mask,
                 speaker_state=duration_speaker_state,
                 speaker_mask=duration_speaker_mask,
-                character_state=duration_character_state,
+                character_state=duration_character_duration_state,
                 character_mask=duration_character_mask,
                 duration_features=duration_features,
                 has_speaker=has_duration_reference,

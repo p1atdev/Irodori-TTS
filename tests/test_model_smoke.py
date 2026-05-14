@@ -136,6 +136,55 @@ def test_character_projector_uses_explicit_initialization(monkeypatch) -> None:
     assert torch.allclose(encoder.norm.weight, torch.ones_like(encoder.norm.weight))
 
 
+def test_character_encoder_can_prepend_global_summary_token(monkeypatch) -> None:
+    patch_character_backbone(monkeypatch, feature_dim=12, num_tokens=4)
+
+    encoder = image_encoder.CharacterImageEncoder(
+        timm_model_id="dummy/character-backbone",
+        output_dim=8,
+        use_all_patches=True,
+        image_size=8,
+        pretrained=False,
+        projector_config=MLPProjectorConfig(
+            hidden_dim=16,
+            num_layers=1,
+        ),
+        prepend_global_summary_token=True,
+    )
+
+    out = encoder(torch.randn(2, 3, 8, 8))
+
+    assert out.shape == (2, 5, 8)
+    assert torch.allclose(out[:, 0], out[:, 1:].mean(dim=1))
+
+
+def test_character_encoder_can_split_duration_state(monkeypatch) -> None:
+    patch_character_backbone(monkeypatch, feature_dim=12, num_tokens=4)
+
+    encoder = image_encoder.CharacterImageEncoder(
+        timm_model_id="dummy/character-backbone",
+        output_dim=8,
+        use_all_patches=True,
+        image_size=8,
+        pretrained=False,
+        projector_config=MLPProjectorConfig(
+            hidden_dim=16,
+            num_layers=1,
+        ),
+        prepend_global_summary_token=True,
+        split_duration_state=True,
+    )
+
+    out = encoder(torch.randn(2, 3, 8, 8))
+
+    assert isinstance(out, image_encoder.CharacterImageEncoderOutput)
+    assert encoder.norm.weight.shape == (16,)
+    assert out.generation_state.shape == (2, 5, 8)
+    assert out.duration_state.shape == (2, 5, 8)
+    assert torch.allclose(out.generation_state[:, 0], out.generation_state[:, 1:].mean(dim=1))
+    assert torch.allclose(out.duration_state[:, 0], out.duration_state[:, 1:].mean(dim=1))
+
+
 def test_base_model_forward_runs_without_error() -> None:
     cfg = make_base_config()
     model = TextToLatentRFDiT(cfg)
@@ -334,6 +383,78 @@ def test_character_duration_predictor_receives_character_state(monkeypatch) -> N
     assert torch.allclose(captured["speaker_state"], expected_state)
     assert torch.equal(captured["speaker_mask"], expected_mask)
     assert torch.equal(captured["has_speaker"], torch.tensor([True, False]))
+
+
+def test_character_duration_predictor_uses_split_duration_state(monkeypatch) -> None:
+    patch_character_backbone(monkeypatch)
+    cfg = make_character_config()
+    cfg.character_projector_split_duration_state = True
+    cfg.use_duration_predictor = True
+    cfg.duration_hidden_dim = 16
+    cfg.duration_layers = 1
+    cfg.duration_dropout = 0.0
+    cfg.duration_architecture = "token_sum_adarn_zero_no_aux"
+    cfg.duration_speaker_fusion = "adarn_zero"
+    model = TextToLatentRFDiT(cfg)
+
+    class FakeSplitCharacterEncoder(nn.Module):
+        def forward(self, images: torch.Tensor) -> image_encoder.CharacterImageEncoderOutput:
+            batch_size = images.shape[0]
+            shape = (batch_size, 3, cfg.character_dim_resolved)
+            generation_state = torch.ones(shape, device=images.device, dtype=images.dtype)
+            duration_state = torch.full(shape, 2.0, device=images.device, dtype=images.dtype)
+            return image_encoder.CharacterImageEncoderOutput(
+                generation_state=generation_state,
+                duration_state=duration_state,
+            )
+
+    model.character_encoder = FakeSplitCharacterEncoder()
+
+    assert model.duration_predictor is not None
+    captured: dict[str, torch.Tensor | None] = {}
+
+    def capture_forward(**kwargs):
+        captured["speaker_state"] = kwargs["speaker_state"]
+        captured["speaker_mask"] = kwargs["speaker_mask"]
+        captured["has_speaker"] = kwargs["has_speaker"]
+        batch_size = kwargs["text_state"].shape[0]
+        return torch.zeros(batch_size, device=kwargs["text_state"].device)
+
+    monkeypatch.setattr(model.duration_predictor, "forward", capture_forward)
+
+    batch_size = 2
+    text_len = 6
+    text_input_ids = torch.randint(0, cfg.text_vocab_size, (batch_size, text_len))
+    text_mask = torch.ones(batch_size, text_len, dtype=torch.bool)
+    character_images = torch.randn(
+        batch_size,
+        3,
+        cfg.character_image_size,
+        cfg.character_image_size,
+    )
+    duration_features = torch.zeros(batch_size, cfg.duration_aux_dim)
+
+    out = model(
+        x_t=None,
+        t=None,
+        text_input_ids=text_input_ids,
+        text_mask=text_mask,
+        speaker_latent=None,
+        speaker_mask=None,
+        character_images=character_images,
+        duration_features=duration_features,
+        duration_only=True,
+    )
+
+    assert out.shape == (batch_size,)
+    assert captured["speaker_state"] is not None
+    assert captured["speaker_mask"] is not None
+    assert captured["speaker_state"].shape == (batch_size, 4, cfg.speaker_dim)
+    assert torch.allclose(
+        captured["speaker_state"], torch.full_like(captured["speaker_state"], 2.0)
+    )
+    assert captured["speaker_mask"].all()
+    assert torch.equal(captured["has_speaker"], torch.ones(batch_size, dtype=torch.bool))
 
 
 def test_character_model_sampling_runs_without_error(monkeypatch) -> None:

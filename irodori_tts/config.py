@@ -45,6 +45,8 @@ class ModelConfig:
     character_image_size: int = 448
     character_hidden_state_index: int | None = None
     character_projector: dict | None = None
+    character_prepend_global_summary_token: bool = False
+    character_projector_split_duration_state: bool = False
     character_attention_mode: str = "joint"
     speaker_dim: int = 1280
     speaker_layers: int = 14

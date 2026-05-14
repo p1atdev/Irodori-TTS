@@ -534,6 +534,8 @@ uv run python train.py \
 | `character_encoder_model` | timm / HF Hub 経由で使う画像エンコーダ |
 | `character_image_size` | 画像入力サイズ |
 | `character_use_all_patches` | 画像エンコーダの全パッチを使うか |
+| `character_prepend_global_summary_token` | projector 後の画像 token 平均を global summary token として先頭に追加するか（default: `false`） |
+| `character_projector_split_duration_state` | projector の最終出力次元を2倍にして、生成用 state と duration 用 state に分割するか（default: `false`） |
 | `character_projector.type` | 画像特徴を音声モデル側に写すプロジェクタの種類（現状 `mlp`） |
 | `character_projector.hidden_dim` | プロジェクタの中間次元 |
 | `character_projector.num_layers` | **MLP ブロック数**。1ブロック = `Linear -> SiLU -> Linear` |
@@ -550,6 +552,8 @@ train:
   preview_samples:
     - text: こんにちは、今日はいい天気ですね。
       image_path: /path/to/character_reference.png
+      use_duration_predictor: true  # v3 duration predictor を使う（true のとき seconds は無視）
+      duration_scale: 1.0
       num_steps: 20
       cfg_scale_text: 3.0
       cfg_scale_character: 3.0

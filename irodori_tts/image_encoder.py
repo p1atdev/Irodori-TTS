@@ -1,5 +1,6 @@
 from collections.abc import Callable
 from os import PathLike
+from typing import NamedTuple
 
 import torch
 import torch.nn as nn
@@ -44,6 +45,11 @@ class _RMSNorm(nn.Module):
         return (x * rms * self.weight).to(x_dtype)
 
 
+class CharacterImageEncoderOutput(NamedTuple):
+    generation_state: torch.Tensor
+    duration_state: torch.Tensor
+
+
 def build_character_transform(timm_model_id: str, image_size: int) -> Callable:
     """
     Build a torchvision transform for preprocessing character reference images.
@@ -75,6 +81,10 @@ class CharacterImageEncoder(nn.Module):
         image_size: Image resize target (H = W).
         pretrained: Whether to load pretrained backbone weights.
         projector_config: Configuration for the projector module.
+        prepend_global_summary_token: Whether to prepend a global summary
+            token computed as the mean of projected character tokens.
+        split_duration_state: Whether to double the projector output dimension
+            and split it into generation and duration states.
     """
 
     def __init__(
@@ -86,6 +96,8 @@ class CharacterImageEncoder(nn.Module):
         pretrained: bool = True,
         projector_config: ProjectorConfig | dict | None = None,
         hidden_state_index: int | None = None,
+        prepend_global_summary_token: bool = False,
+        split_duration_state: bool = False,
     ):
         super().__init__()
 
@@ -107,6 +119,8 @@ class CharacterImageEncoder(nn.Module):
         self.use_all_patches = use_all_patches
         self._image_size = image_size
         self._hidden_state_index = hidden_state_index
+        self.prepend_global_summary_token = bool(prepend_global_summary_token)
+        self.split_duration_state = bool(split_duration_state)
 
         if hidden_state_index is not None and not hasattr(backbone, "forward_intermediates"):
             raise ValueError(
@@ -132,9 +146,10 @@ class CharacterImageEncoder(nn.Module):
                     f"Unexpected backbone output ndim={out.ndim} for {timm_model_id!r}"
                 )
 
-        self.proj = build_projector(projector_config, backbone_dim, output_dim)
+        projector_output_dim = output_dim * 2 if self.split_duration_state else output_dim
+        self.proj = build_projector(projector_config, backbone_dim, projector_output_dim)
         # Post-projection norm for stable training (mirrors caption_norm pattern).
-        self.norm = _RMSNorm(output_dim)
+        self.norm = _RMSNorm(projector_output_dim)
 
     def _backbone_forward(self, images: torch.Tensor) -> torch.Tensor:
         """Run the backbone, optionally returning an intermediate hidden state."""
@@ -152,7 +167,7 @@ class CharacterImageEncoder(nn.Module):
 
         return hidden_state
 
-    def forward(self, images: torch.Tensor) -> torch.Tensor:
+    def forward(self, images: torch.Tensor) -> torch.Tensor | CharacterImageEncoderOutput:
         """
         Args:
             images: Preprocessed image batch of shape ``(B, 3, H, W)``.
@@ -176,5 +191,14 @@ class CharacterImageEncoder(nn.Module):
             if not self.use_all_patches:
                 features = features[:, :1, :]
 
-        projected = self.proj(features)  # (B, N, output_dim)
-        return self.norm(projected)
+        projected = self.norm(self.proj(features))  # (B, N, output_dim)
+        if self.prepend_global_summary_token:
+            summary_token = projected.mean(dim=1, keepdim=True)
+            projected = torch.cat([summary_token, projected], dim=1)
+        if self.split_duration_state:
+            generation_state, duration_state = projected.chunk(2, dim=-1)
+            return CharacterImageEncoderOutput(
+                generation_state=generation_state,
+                duration_state=duration_state,
+            )
+        return projected
