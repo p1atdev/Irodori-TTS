@@ -531,9 +531,13 @@ uv run python train.py \
 | パラメータ | 説明 |
 |---|---|
 | `use_character_condition: true` | 画像条件付けを有効化 |
-| `character_encoder_model` | timm / HF Hub 経由で使う画像エンコーダ |
+| `character_encoder_model` | timm / HF Hub 経由で使う画像エンコーダ。`ccip:ccip-caformer_b36-24` で CCIP CAFormer-B36、`ccip:ccip-caformer-24-randaug-pruned` で軽量な CCIP CAFormer-S36 を使用 |
 | `character_image_size` | 画像入力サイズ |
+| `character_hidden_state_index` | timm の `forward_intermediates` を使う場合の hidden state index。CCIP CAFormer では通常 `null` のまま最終 feature map を使う |
 | `character_use_all_patches` | 画像エンコーダの全パッチを使うか |
+| `character_encoder_drop_rate` | timm 画像エンコーダ内の通常 dropout 率（default: `0.0`） |
+| `character_encoder_attn_drop_rate` | timm 画像エンコーダ内の attention dropout 率（default: `0.0`） |
+| `character_encoder_drop_path_rate` | timm 画像エンコーダ内の stochastic depth/drop path 率（default: `0.0`） |
 | `character_prepend_global_summary_token` | projector 後の画像 token 平均を global summary token として先頭に追加するか（default: `false`） |
 | `character_projector_split_duration_state` | projector の最終出力次元を2倍にして、生成用 state と duration 用 state に分割するか（default: `false`） |
 | `character_projector.type` | 画像特徴を音声モデル側に写すプロジェクタの種類（現状 `mlp`） |

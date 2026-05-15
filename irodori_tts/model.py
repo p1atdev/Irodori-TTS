@@ -1332,6 +1332,9 @@ class TextToLatentRFDiT(nn.Module):
                 image_size=cfg.character_image_size,
                 projector_config=cfg.character_projector_resolved,
                 hidden_state_index=cfg.character_hidden_state_index,
+                drop_rate=cfg.character_encoder_drop_rate,
+                attn_drop_rate=cfg.character_encoder_attn_drop_rate,
+                drop_path_rate=cfg.character_encoder_drop_path_rate,
                 prepend_global_summary_token=cfg.character_prepend_global_summary_token,
                 split_duration_state=cfg.character_projector_split_duration_state,
             )

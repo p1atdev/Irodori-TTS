@@ -13,15 +13,20 @@ model:
   text_heads: 8
   # Character reference conditioning (disables speaker conditioning)
   use_character_condition: true
-  # character_encoder_model: hf_hub:SmilingWolf/wd-swinv2-tagger-v3
-  character_encoder_model: hf_hub:SmilingWolf/wd-vit-tagger-v3
-  # character_encoder_model: hf_hub:timm/vit_base_patch16_siglip_512.v2_webli
-  character_hidden_state_index: -5
+  # CCIP uses a CAFormer backbone trained for anime character similarity.
+  character_encoder_model: ccip:ccip-caformer_b36-24
+  # character_encoder_model: ccip:ccip-caformer-24-randaug-pruned  # lighter S36 variant
+  # character_encoder_model: hf_hub:SmilingWolf/wd-vit-tagger-v3
+  character_hidden_state_index: null
+  # Training-time dropout/stochastic depth inside the timm image encoder.
+  character_encoder_drop_rate: 0.0
+  character_encoder_attn_drop_rate: 0.0
+  character_encoder_drop_path_rate: 0.0
   character_dim: 768
   character_use_all_patches: true
   character_prepend_global_summary_token: false
   character_projector_split_duration_state: false
-  character_image_size: 448
+  character_image_size: 384
   # character_image_size: 512 # siglip2
   character_attention_mode: joint  # joint or cross
   character_projector:

@@ -1,4 +1,5 @@
-from collections.abc import Callable
+import re
+from collections.abc import Callable, Mapping
 from os import PathLike
 from typing import NamedTuple
 
@@ -9,6 +10,33 @@ from timm import create_model
 from timm import data as timm_data
 
 from .projector import ProjectorConfig, build_projector, resolve_projector_config
+
+_CCIP_PREFIX = "ccip:"
+_CCIP_REPO_ID = "deepghs/ccip"
+_CCIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
+_CCIP_STD = (0.26862954, 0.26130258, 0.27577711)
+_CCIP_CAFormer_PREFIX = "module._orig_mod.feature.backbone.caformer."
+_CCIP_STAGE_BLOCK_PATTERN = re.compile(r"^stages\.(\d+)\.(\d+)\.")
+
+
+class _CCIPModelSpec(NamedTuple):
+    name: str
+    timm_model_id: str
+    checkpoint_filename: str
+
+
+_CCIP_MODEL_SPECS = {
+    "ccip-caformer_b36-24": _CCIPModelSpec(
+        name="ccip-caformer_b36-24",
+        timm_model_id="caformer_b36",
+        checkpoint_filename="ccip-caformer_b36-24.ckpt",
+    ),
+    "ccip-caformer-24-randaug-pruned": _CCIPModelSpec(
+        name="ccip-caformer-24-randaug-pruned",
+        timm_model_id="caformer_s36",
+        checkpoint_filename="ccip-caformer-24-randaug-pruned.ckpt",
+    ),
+}
 
 
 def load_character_image(
@@ -50,6 +78,178 @@ class CharacterImageEncoderOutput(NamedTuple):
     duration_state: torch.Tensor
 
 
+def _validate_dropout_rate(name: str, value: float) -> float:
+    value = float(value)
+    if not 0.0 <= value <= 1.0:
+        raise ValueError(f"{name} must be in [0, 1], got {value}")
+    return value
+
+
+def _build_timm_dropout_kwargs(
+    *,
+    drop_rate: float,
+    attn_drop_rate: float,
+    drop_path_rate: float,
+) -> dict[str, float]:
+    rates = {
+        "drop_rate": _validate_dropout_rate("drop_rate", drop_rate),
+        "attn_drop_rate": _validate_dropout_rate("attn_drop_rate", attn_drop_rate),
+        "drop_path_rate": _validate_dropout_rate("drop_path_rate", drop_path_rate),
+    }
+    return {name: value for name, value in rates.items() if value > 0.0}
+
+
+def _resolve_ccip_model_spec(model_id: str) -> _CCIPModelSpec | None:
+    if not model_id.startswith(_CCIP_PREFIX):
+        return None
+
+    name = model_id[len(_CCIP_PREFIX) :].strip()
+    if name.endswith(".ckpt"):
+        name = name[: -len(".ckpt")]
+    try:
+        return _CCIP_MODEL_SPECS[name]
+    except KeyError as exc:
+        known = ", ".join(sorted(_CCIP_MODEL_SPECS))
+        raise ValueError(
+            f"Unknown CCIP character encoder {model_id!r}. Supported models: {known}"
+        ) from exc
+
+
+def _ccip_stage_replacement(match: re.Match[str]) -> str:
+    return f"stages.{match.group(1)}.blocks.{match.group(2)}."
+
+
+def _convert_ccip_caformer_state_dict(
+    checkpoint_state: Mapping[str, torch.Tensor],
+    target_state: Mapping[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    converted: dict[str, torch.Tensor] = {}
+
+    for key, value in checkpoint_state.items():
+        if not key.startswith(_CCIP_CAFormer_PREFIX):
+            continue
+
+        new_key = key[len(_CCIP_CAFormer_PREFIX) :]
+        if new_key.startswith("downsample_layers.0.conv."):
+            new_key = new_key.replace("downsample_layers.0.conv.", "stem.conv.", 1)
+        elif new_key.startswith("downsample_layers.0.post_norm."):
+            new_key = new_key.replace("downsample_layers.0.post_norm.", "stem.norm.", 1)
+        else:
+            for stage_index in (1, 2, 3):
+                if new_key.startswith(f"downsample_layers.{stage_index}.pre_norm."):
+                    new_key = new_key.replace(
+                        f"downsample_layers.{stage_index}.pre_norm.",
+                        f"stages.{stage_index}.downsample.norm.",
+                        1,
+                    )
+                if new_key.startswith(f"downsample_layers.{stage_index}.conv."):
+                    new_key = new_key.replace(
+                        f"downsample_layers.{stage_index}.conv.",
+                        f"stages.{stage_index}.downsample.conv.",
+                        1,
+                    )
+
+        new_key = _CCIP_STAGE_BLOCK_PATTERN.sub(_ccip_stage_replacement, new_key)
+        if new_key.startswith("norm."):
+            new_key = new_key.replace("norm.", "head.norm.", 1)
+        elif new_key.startswith("head.fc1."):
+            new_key = new_key.replace("head.fc1.", "head.fc.fc1.", 1)
+        elif new_key.startswith("head.norm."):
+            new_key = new_key.replace("head.norm.", "head.fc.norm.", 1)
+        elif new_key.startswith("head.fc2."):
+            new_key = new_key.replace("head.fc2.", "head.fc.fc2.", 1)
+
+        target_value = target_state.get(new_key)
+        if (
+            target_value is not None
+            and value.ndim == 2
+            and target_value.ndim == 4
+            and target_value.shape[-2:] == (1, 1)
+        ):
+            value = value[:, :, None, None]
+
+        converted[new_key] = value
+
+    missing = [key for key in target_state if key not in converted]
+    unexpected = [key for key in converted if key not in target_state]
+    mismatched = [
+        (key, tuple(value.shape), tuple(target_state[key].shape))
+        for key, value in converted.items()
+        if key in target_state and tuple(value.shape) != tuple(target_state[key].shape)
+    ]
+    if missing or unexpected or mismatched:
+        details = []
+        if missing:
+            details.append(f"missing={missing[:8]}")
+        if unexpected:
+            details.append(f"unexpected={unexpected[:8]}")
+        if mismatched:
+            details.append(f"mismatched={mismatched[:8]}")
+        raise RuntimeError("Failed to convert CCIP CAFormer checkpoint: " + "; ".join(details))
+
+    return converted
+
+
+def _load_ccip_caformer_state_dict(
+    backbone: nn.Module,
+    checkpoint_state: Mapping[str, torch.Tensor],
+) -> None:
+    converted = _convert_ccip_caformer_state_dict(checkpoint_state, backbone.state_dict())
+    backbone.load_state_dict(converted, strict=True)
+
+
+def _create_ccip_backbone(
+    spec: _CCIPModelSpec,
+    *,
+    pretrained: bool,
+    timm_dropout_kwargs: dict[str, float],
+) -> nn.Module:
+    backbone = create_model(
+        spec.timm_model_id,
+        pretrained=False,
+        num_classes=2,
+        global_pool="",
+        **timm_dropout_kwargs,
+    )
+    if pretrained:
+        from huggingface_hub import hf_hub_download
+
+        checkpoint_path = hf_hub_download(_CCIP_REPO_ID, spec.checkpoint_filename)
+        checkpoint_state = torch.load(
+            checkpoint_path,
+            map_location="cpu",
+            weights_only=True,
+        )
+        if not isinstance(checkpoint_state, Mapping):
+            raise RuntimeError(
+                f"Expected CCIP checkpoint to contain a state_dict mapping, got {type(checkpoint_state)!r}"
+            )
+        _load_ccip_caformer_state_dict(backbone, checkpoint_state)
+    return backbone
+
+
+def _create_character_backbone(
+    timm_model_id: str,
+    *,
+    pretrained: bool,
+    timm_dropout_kwargs: dict[str, float],
+) -> nn.Module:
+    ccip_spec = _resolve_ccip_model_spec(timm_model_id)
+    if ccip_spec is not None:
+        return _create_ccip_backbone(
+            ccip_spec,
+            pretrained=pretrained,
+            timm_dropout_kwargs=timm_dropout_kwargs,
+        )
+
+    return create_model(
+        timm_model_id,
+        pretrained=pretrained,
+        global_pool="",
+        **timm_dropout_kwargs,
+    )
+
+
 def build_character_transform(timm_model_id: str, image_size: int) -> Callable:
     """
     Build a torchvision transform for preprocessing character reference images.
@@ -57,6 +257,16 @@ def build_character_transform(timm_model_id: str, image_size: int) -> Callable:
     The returned transform is a torchvision Compose and is safe to pickle for
     DataLoader multiprocessing workers.
     """
+    if _resolve_ccip_model_spec(timm_model_id) is not None:
+        return timm_data.create_transform(
+            input_size=(3, image_size, image_size),
+            is_training=False,
+            interpolation="bilinear",
+            mean=_CCIP_MEAN,
+            std=_CCIP_STD,
+            crop_pct=1.0,
+        )
+
     m = create_model(timm_model_id, pretrained=False)
     data_cfg = timm_data.resolve_model_data_config(m)
     data_cfg["input_size"] = (3, image_size, image_size)
@@ -81,6 +291,9 @@ class CharacterImageEncoder(nn.Module):
         image_size: Image resize target (H = W).
         pretrained: Whether to load pretrained backbone weights.
         projector_config: Configuration for the projector module.
+        drop_rate: Dropout probability passed to timm backbones that support it.
+        attn_drop_rate: Attention dropout probability passed to timm backbones that support it.
+        drop_path_rate: Stochastic depth probability passed to timm backbones that support it.
         prepend_global_summary_token: Whether to prepend a global summary
             token computed as the mean of projected character tokens.
         split_duration_state: Whether to double the projector output dimension
@@ -96,6 +309,9 @@ class CharacterImageEncoder(nn.Module):
         pretrained: bool = True,
         projector_config: ProjectorConfig | dict | None = None,
         hidden_state_index: int | None = None,
+        drop_rate: float = 0.0,
+        attn_drop_rate: float = 0.0,
+        drop_path_rate: float = 0.0,
         prepend_global_summary_token: bool = False,
         split_duration_state: bool = False,
     ):
@@ -104,12 +320,26 @@ class CharacterImageEncoder(nn.Module):
         if projector_config is None or isinstance(projector_config, dict):
             projector_config = resolve_projector_config(projector_config)
 
-        # Load backbone without classification head, retaining all spatial tokens.
-        backbone = create_model(
-            timm_model_id,
-            pretrained=pretrained,
-            global_pool="",
+        timm_dropout_kwargs = _build_timm_dropout_kwargs(
+            drop_rate=drop_rate,
+            attn_drop_rate=attn_drop_rate,
+            drop_path_rate=drop_path_rate,
         )
+
+        # Load backbone without classification head, retaining all spatial tokens.
+        try:
+            backbone = _create_character_backbone(
+                timm_model_id,
+                pretrained=pretrained,
+                timm_dropout_kwargs=timm_dropout_kwargs,
+            )
+        except TypeError as exc:
+            if timm_dropout_kwargs:
+                names = ", ".join(sorted(timm_dropout_kwargs))
+                raise TypeError(
+                    f"Backbone {timm_model_id!r} failed to initialize with timm dropout kwargs: {names}"
+                ) from exc
+            raise
         # num_classes=0 にするとヘッドが削除されてから load_state_dict されてエラーになってしまうため、
         # 読み込んでからヘッドを消す
         reset_classifier = getattr(backbone, "reset_classifier", None)

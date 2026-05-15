@@ -108,6 +108,16 @@ The hosted VoiceDesign demo is available at [Aratako/Irodori-TTS-500M-v2-VoiceDe
 
 `gradio_app.py` is for `Aratako/Irodori-TTS-500M-v3`. `gradio_app_voicedesign.py` is for `Aratako/Irodori-TTS-500M-v2-VoiceDesign`.
 
+For comparing Character Reference checkpoints across many reference images and dialogue
+lines, use the batch preview UI:
+
+```bash
+uv run python gradio_app_character_batch.py --server-name 0.0.0.0 --server-port 7863
+```
+
+Generated previews are cached in `gradio_outputs_character_batch/`, so previously
+synthesized model/image/dialogue pairs remain available for later comparison.
+
 ## Inference
 
 ### CLI

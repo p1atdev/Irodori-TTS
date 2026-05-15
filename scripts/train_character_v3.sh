@@ -2,7 +2,7 @@
 
 INIT_CHECKPOINT="models/500m_v3.safetensors"
 # INIT_CHECKPOINT="models/500m_v3_character.safetensors"
-OUTPUT_DIR="outputs/v3_character_41"
+OUTPUT_DIR="outputs/v3_character_43"
 
 uv run train.py \
   --config configs/train_500m_v3_character.yaml \

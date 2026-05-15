@@ -44,6 +44,9 @@ class ModelConfig:
     character_use_all_patches: bool = True
     character_image_size: int = 448
     character_hidden_state_index: int | None = None
+    character_encoder_drop_rate: float = 0.0
+    character_encoder_attn_drop_rate: float = 0.0
+    character_encoder_drop_path_rate: float = 0.0
     character_projector: dict | None = None
     character_prepend_global_summary_token: bool = False
     character_projector_split_duration_state: bool = False

@@ -218,6 +218,7 @@ __marimo__/
 gradio_outputs/
 gradio_outputs_voicedesign/
 gradio_outputs_character/
+gradio_outputs_character_batch/
 
 models/
 

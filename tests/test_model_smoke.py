@@ -1,5 +1,6 @@
 # ruff: noqa: E402
 import sys
+from collections import OrderedDict
 from pathlib import Path
 
 import torch
@@ -106,6 +107,95 @@ def patch_character_backbone(monkeypatch, *, feature_dim: int = 12, num_tokens: 
             feature_dim=feature_dim,
             num_tokens=num_tokens,
         ),
+    )
+
+
+def test_character_encoder_passes_timm_dropout_config(monkeypatch) -> None:
+    captured_kwargs = {}
+
+    def fake_create_model(*args, **kwargs):
+        del args
+        captured_kwargs.update(kwargs)
+        return DummyImageBackbone()
+
+    monkeypatch.setattr(image_encoder, "create_model", fake_create_model)
+    cfg = make_character_config()
+    cfg.character_encoder_drop_rate = 0.1
+    cfg.character_encoder_attn_drop_rate = 0.2
+    cfg.character_encoder_drop_path_rate = 0.03
+
+    TextToLatentRFDiT(cfg)
+
+    assert captured_kwargs["drop_rate"] == 0.1
+    assert captured_kwargs["attn_drop_rate"] == 0.2
+    assert captured_kwargs["drop_path_rate"] == 0.03
+
+
+def test_ccip_transform_uses_ccip_preprocess(monkeypatch) -> None:
+    captured_kwargs = {}
+    sentinel = object()
+
+    def fake_create_transform(**kwargs):
+        captured_kwargs.update(kwargs)
+        return sentinel
+
+    def unexpected_create_model(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("CCIP transform should not instantiate a timm model")
+
+    monkeypatch.setattr(image_encoder.timm_data, "create_transform", fake_create_transform)
+    monkeypatch.setattr(image_encoder, "create_model", unexpected_create_model)
+
+    transform = image_encoder.build_character_transform("ccip:ccip-caformer_b36-24", 384)
+
+    assert transform is sentinel
+    assert captured_kwargs["input_size"] == (3, 384, 384)
+    assert captured_kwargs["interpolation"] == "bilinear"
+    assert captured_kwargs["crop_pct"] == 1.0
+    assert captured_kwargs["mean"] == image_encoder._CCIP_MEAN
+    assert captured_kwargs["std"] == image_encoder._CCIP_STD
+
+
+def test_convert_ccip_caformer_state_dict_maps_timm_keys() -> None:
+    prefix = image_encoder._CCIP_CAFormer_PREFIX
+    target_state = OrderedDict(
+        {
+            "stem.conv.weight": torch.empty(2, 3, 7, 7),
+            "stem.norm.weight": torch.empty(2),
+            "stages.1.downsample.norm.weight": torch.empty(2),
+            "stages.1.downsample.conv.weight": torch.empty(4, 2, 3, 3),
+            "stages.0.blocks.0.token_mixer.pwconv1.weight": torch.empty(4, 2, 1, 1),
+            "head.norm.weight": torch.empty(8),
+            "head.fc.fc1.weight": torch.empty(32, 8),
+            "head.fc.norm.weight": torch.empty(32),
+            "head.fc.fc2.weight": torch.empty(2, 32),
+        }
+    )
+    checkpoint_state = OrderedDict(
+        {
+            f"{prefix}downsample_layers.0.conv.weight": torch.randn(2, 3, 7, 7),
+            f"{prefix}downsample_layers.0.post_norm.weight": torch.randn(2),
+            f"{prefix}downsample_layers.1.pre_norm.weight": torch.randn(2),
+            f"{prefix}downsample_layers.1.conv.weight": torch.randn(4, 2, 3, 3),
+            f"{prefix}stages.0.0.token_mixer.pwconv1.weight": torch.randn(4, 2),
+            f"{prefix}norm.weight": torch.randn(8),
+            f"{prefix}head.fc1.weight": torch.randn(32, 8),
+            f"{prefix}head.norm.weight": torch.randn(32),
+            f"{prefix}head.fc2.weight": torch.randn(2, 32),
+            "module._orig_mod.feature.backbone.attnpool.q_proj.weight": torch.randn(8, 8),
+        }
+    )
+
+    converted = image_encoder._convert_ccip_caformer_state_dict(
+        checkpoint_state,
+        target_state,
+    )
+
+    assert set(converted) == set(target_state)
+    assert converted["stages.0.blocks.0.token_mixer.pwconv1.weight"].shape == (4, 2, 1, 1)
+    assert torch.equal(
+        converted["stages.0.blocks.0.token_mixer.pwconv1.weight"].squeeze(-1).squeeze(-1),
+        checkpoint_state[f"{prefix}stages.0.0.token_mixer.pwconv1.weight"],
     )
 
 
