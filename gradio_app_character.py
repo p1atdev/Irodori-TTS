@@ -8,6 +8,7 @@ from pathlib import Path
 import gradio as gr
 from huggingface_hub import hf_hub_download
 
+from irodori_tts.gradio_emoji_palette import EMOJI_PALETTE_CSS, build_emoji_palette
 from irodori_tts.inference_runtime import (
     RuntimeKey,
     SamplingRequest,
@@ -19,7 +20,6 @@ from irodori_tts.inference_runtime import (
     save_wav,
 )
 
-FIXED_SECONDS = 30.0
 MAX_GRADIO_CANDIDATES = 32
 GRADIO_AUDIO_COLS_PER_ROW = 8
 
@@ -59,6 +59,10 @@ def _on_model_device_change(device: str) -> gr.Dropdown:
 def _on_codec_device_change(device: str) -> gr.Dropdown:
     choices = _precision_choices_for_device(device)
     return gr.Dropdown(choices=choices, value=choices[0])
+
+
+def _on_t_schedule_mode_change(mode: str) -> object:
+    return gr.update(interactive=str(mode).strip().lower() == "sway")
 
 
 def _parse_optional_float(raw: str | None, label: str) -> float | None:
@@ -114,7 +118,6 @@ def _build_runtime_key(
     model_precision: str,
     codec_device: str,
     codec_precision: str,
-    enable_watermark: bool,
 ) -> RuntimeKey:
     checkpoint_path = _resolve_checkpoint_path(checkpoint)
     return RuntimeKey(
@@ -124,7 +127,6 @@ def _build_runtime_key(
         model_precision=str(model_precision),
         codec_device=str(codec_device),
         codec_precision=str(codec_precision),
-        enable_watermark=bool(enable_watermark),
         compile_model=False,
         compile_dynamic=False,
     )
@@ -136,7 +138,6 @@ def _describe_runtime(
     model_precision: str,
     codec_device: str,
     codec_precision: str,
-    enable_watermark: bool,
 ) -> str:
     runtime_key = _build_runtime_key(
         checkpoint=checkpoint,
@@ -144,7 +145,6 @@ def _describe_runtime(
         model_precision=model_precision,
         codec_device=codec_device,
         codec_precision=codec_precision,
-        enable_watermark=enable_watermark,
     )
     runtime, reloaded = get_cached_runtime(runtime_key)
     status = (
@@ -170,6 +170,7 @@ def _describe_runtime(
             f"codec_precision: {runtime_key.codec_precision}",
             f"use_character_condition: {runtime.model_cfg.use_character_condition}",
             f"use_speaker_condition: {runtime.model_cfg.use_speaker_condition}",
+            f"use_duration_predictor: {runtime.model_cfg.use_duration_predictor}",
             *notes,
         ]
     )
@@ -181,12 +182,15 @@ def _run_generation(
     model_precision: str,
     codec_device: str,
     codec_precision: str,
-    enable_watermark: bool,
     text: str,
     character_image: str | None,
     num_steps: int,
     num_candidates: int,
     seed_raw: str,
+    seconds_raw: str,
+    duration_scale: float,
+    t_schedule_mode: str,
+    sway_coeff: float,
     cfg_guidance_mode: str,
     cfg_scale_text: float,
     cfg_scale_character: float,
@@ -208,7 +212,6 @@ def _run_generation(
         model_precision=model_precision,
         codec_device=codec_device,
         codec_precision=codec_precision,
-        enable_watermark=enable_watermark,
     )
 
     text_value = str(text).strip()
@@ -229,6 +232,7 @@ def _run_generation(
     rescale_k = _parse_optional_float(rescale_k_raw, "rescale_k")
     rescale_sigma = _parse_optional_float(rescale_sigma_raw, "rescale_sigma")
     seed = _parse_optional_int(seed_raw, "seed")
+    manual_seconds = _parse_optional_float(seconds_raw, "seconds")
 
     runtime, reloaded = get_cached_runtime(runtime_key)
     if not runtime.model_cfg.use_character_condition:
@@ -246,15 +250,17 @@ def _run_generation(
     stdout_log(
         (
             "[gradio-character] request: model_device={} model_precision={} codec_device={} codec_precision={} "
-            "watermark={} mode={} seconds={} steps={} seed={} candidates={}"
+            "mode={} schedule={} sway_coeff={} seconds={} duration_scale={} steps={} seed={} candidates={}"
         ).format(
             model_device,
             model_precision,
             codec_device,
             codec_precision,
-            enable_watermark,
             cfg_guidance_mode,
-            FIXED_SECONDS,
+            t_schedule_mode,
+            sway_coeff,
+            "auto" if manual_seconds is None else manual_seconds,
+            duration_scale,
             num_steps,
             "random" if seed is None else seed,
             requested_candidates,
@@ -279,7 +285,8 @@ def _run_generation(
             ref_ensure_max=True,
             num_candidates=requested_candidates,
             decode_mode="sequential",
-            seconds=FIXED_SECONDS,
+            seconds=manual_seconds,
+            duration_scale=float(duration_scale),
             max_ref_seconds=30.0,
             max_text_len=max_text_len,
             num_steps=int(num_steps),
@@ -299,6 +306,8 @@ def _run_generation(
             speaker_kv_scale=None,
             speaker_kv_min_t=None,
             speaker_kv_max_layers=None,
+            t_schedule_mode=str(t_schedule_mode),
+            sway_coeff=float(sway_coeff),
             trim_tail=True,
         ),
         log_fn=stdout_log,
@@ -375,7 +384,7 @@ def build_ui() -> gr.Blocks:
             model_precision = gr.Dropdown(
                 label="Model Precision",
                 choices=model_precision_choices,
-                value=model_precision_choices[0],
+                value=model_precision_choices[-1],
                 scale=1,
             )
             codec_device = gr.Dropdown(
@@ -387,10 +396,9 @@ def build_ui() -> gr.Blocks:
             codec_precision = gr.Dropdown(
                 label="Codec Precision",
                 choices=codec_precision_choices,
-                value=codec_precision_choices[0],
+                value=codec_precision_choices[-1],
                 scale=1,
             )
-            enable_watermark = gr.State(False)
 
         with gr.Row():
             load_model_btn = gr.Button("Load Model")
@@ -398,7 +406,13 @@ def build_ui() -> gr.Blocks:
             clear_cache_msg = gr.Textbox(label="Model Status", interactive=False)
 
         with gr.Row():
-            text = gr.Textbox(label="Text", lines=4, scale=2)
+            with gr.Column(scale=2):
+                text = gr.Textbox(
+                    label="Text",
+                    lines=6,
+                    elem_id="irodori-character-text-input",
+                )
+                build_emoji_palette(text, open=False)
             character_image = gr.Image(
                 label="Character Reference Image",
                 type="filepath",
@@ -417,6 +431,29 @@ def build_ui() -> gr.Blocks:
                     step=1,
                 )
                 seed_raw = gr.Textbox(label="Seed (blank=random)", value="")
+                seconds_raw = gr.Textbox(label="Seconds (blank=auto)", value="")
+                duration_scale = gr.Slider(
+                    label="Duration Scale",
+                    minimum=0.5,
+                    maximum=1.5,
+                    value=1.0,
+                    step=0.01,
+                )
+
+            with gr.Row():
+                t_schedule_mode = gr.Dropdown(
+                    label="Time Schedule",
+                    choices=["linear", "sway"],
+                    value="linear",
+                )
+                sway_coeff = gr.Slider(
+                    label="Sway Coeff",
+                    minimum=-1.0,
+                    maximum=1.5,
+                    value=-1.0,
+                    step=0.1,
+                    interactive=False,
+                )
 
             with gr.Row():
                 cfg_guidance_mode = gr.Dropdown(
@@ -485,12 +522,15 @@ def build_ui() -> gr.Blocks:
                 model_precision,
                 codec_device,
                 codec_precision,
-                enable_watermark,
                 text,
                 character_image,
                 num_steps,
                 num_candidates,
                 seed_raw,
+                seconds_raw,
+                duration_scale,
+                t_schedule_mode,
+                sway_coeff,
                 cfg_guidance_mode,
                 cfg_scale_text,
                 cfg_scale_character,
@@ -511,6 +551,9 @@ def build_ui() -> gr.Blocks:
         codec_device.change(
             _on_codec_device_change, inputs=[codec_device], outputs=[codec_precision]
         )
+        t_schedule_mode.change(
+            _on_t_schedule_mode_change, inputs=[t_schedule_mode], outputs=[sway_coeff]
+        )
 
         load_model_btn.click(
             _describe_runtime,
@@ -520,7 +563,6 @@ def build_ui() -> gr.Blocks:
                 model_precision,
                 codec_device,
                 codec_precision,
-                enable_watermark,
             ],
             outputs=[clear_cache_msg],
         )
@@ -546,6 +588,7 @@ def main() -> None:
         server_port=args.server_port,
         share=bool(args.share),
         debug=bool(args.debug),
+        css=EMOJI_PALETTE_CSS,
     )
 
 

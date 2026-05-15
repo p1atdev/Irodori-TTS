@@ -114,7 +114,7 @@ def build_server_parser(*, description: str, default_port: int) -> argparse.Argu
         "--enable-watermark",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="Enable DACVAE watermark branch during decode (default: disabled).",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--compile-model",
@@ -161,7 +161,6 @@ def build_runtime_key_from_args(args: argparse.Namespace) -> RuntimeKey:
         model_precision=str(args.model_precision),
         codec_device=str(args.codec_device),
         codec_precision=str(args.codec_precision),
-        enable_watermark=bool(args.enable_watermark),
         compile_model=bool(args.compile_model),
         compile_dynamic=bool(args.compile_dynamic),
     )

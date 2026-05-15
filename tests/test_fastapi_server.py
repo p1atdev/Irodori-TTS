@@ -5,6 +5,7 @@ import logging
 import sys
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 
@@ -13,6 +14,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from irodori_tts.fastapi_server import (
+    build_runtime_key_from_args,
     configure_application_logging,
     create_synthesis_response,
 )
@@ -54,6 +56,30 @@ def test_configure_application_logging_adds_root_handler_and_sets_levels() -> No
         root_logger.handlers.extend(old_handlers)
         root_logger.setLevel(old_root_level)
         irodori_logger.setLevel(old_irodori_level)
+
+
+def test_build_runtime_key_ignores_legacy_watermark_arg(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "model.safetensors"
+    checkpoint.write_bytes(b"")
+    args = SimpleNamespace(
+        checkpoint=str(checkpoint),
+        hf_checkpoint=None,
+        model_device="cpu",
+        codec_repo="test/codec",
+        model_precision="fp32",
+        codec_device="cpu",
+        codec_precision="fp32",
+        enable_watermark=True,
+        compile_model=False,
+        compile_dynamic=False,
+    )
+
+    key = build_runtime_key_from_args(args)
+
+    assert key.checkpoint == str(checkpoint)
+    assert key.model_device == "cpu"
+    assert key.codec_repo == "test/codec"
+    assert not hasattr(key, "enable_watermark")
 
 
 def test_create_synthesis_response_single_candidate_returns_complete_wav_bytes(

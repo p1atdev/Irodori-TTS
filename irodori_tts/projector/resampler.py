@@ -75,8 +75,6 @@ class PerceiverAttention(nn.Module):
             key = self.norm_k(key)
 
         attn = F.scaled_dot_product_attention(query, key, value, is_causal=False)
-
-        attn = attn.permute(0, 2, 1, 3).contiguous()
         attn = self._post_attn_reshape(attn)
         if self.is_gated:
             gate = self.to_gate(latents)
