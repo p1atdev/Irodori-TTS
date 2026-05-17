@@ -1662,7 +1662,7 @@ def preview_sample_to_sampling_request(cfg: PreviewSampleConfig) -> tuple[Sampli
             caption=cfg.caption,
             ref_wav=cfg.ref_wav,
             ref_latent=None,
-            no_ref=False,
+            no_ref=cfg.ref_wav is None or str(cfg.ref_wav).strip() == "",
             ref_normalize_db=-16.0,
             ref_ensure_max=True,
             num_candidates=1,

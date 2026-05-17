@@ -11,7 +11,8 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import irodori_tts.image_encoder as image_encoder
-from irodori_tts.config import ModelConfig
+from irodori_tts.config import ModelConfig, TrainConfig
+from irodori_tts.lora import apply_lora
 from irodori_tts.model import TextToLatentRFDiT
 from irodori_tts.projector import MLPProjectorConfig
 from irodori_tts.rf import sample_euler_rf_cfg
@@ -578,6 +579,55 @@ def test_character_duration_predictor_uses_split_duration_state(monkeypatch) -> 
     )
     assert captured["speaker_mask"].all()
     assert torch.equal(captured["has_speaker"], torch.ones(batch_size, dtype=torch.bool))
+
+
+def test_lora_modules_to_save_duration_predictor_forward_runs_without_error() -> None:
+    cfg = make_base_config()
+    cfg.use_duration_predictor = True
+    cfg.duration_hidden_dim = 16
+    cfg.duration_layers = 1
+    cfg.duration_dropout = 0.0
+    cfg.duration_architecture = "token_sum_adarn_zero_no_aux"
+    cfg.duration_speaker_fusion = "adarn_zero"
+    model = TextToLatentRFDiT(cfg)
+    peft_model = apply_lora(
+        model,
+        TrainConfig(
+            lora_enabled=True,
+            lora_r=2,
+            lora_alpha=2,
+            lora_target_modules="diffusion_attn",
+            lora_modules_to_save="auto",
+        ),
+    )
+
+    batch_size = 2
+    seq_len = 4
+    text_len = 5
+    ref_len = 3
+    x_t = torch.randn(batch_size, seq_len, cfg.patched_latent_dim)
+    t = torch.rand(batch_size)
+    text_input_ids = torch.randint(0, cfg.text_vocab_size, (batch_size, text_len))
+    text_mask = torch.ones(batch_size, text_len, dtype=torch.bool)
+    speaker_latent = torch.randn(batch_size, ref_len, cfg.patched_latent_dim)
+    speaker_mask = torch.ones(batch_size, ref_len, dtype=torch.bool)
+    duration_features = torch.zeros(batch_size, cfg.duration_aux_dim)
+    duration_has_speaker = torch.ones(batch_size, dtype=torch.bool)
+
+    v_pred, duration_pred = peft_model(
+        x_t=x_t,
+        t=t,
+        text_input_ids=text_input_ids,
+        text_mask=text_mask,
+        speaker_latent=speaker_latent,
+        speaker_mask=speaker_mask,
+        duration_features=duration_features,
+        duration_has_speaker=duration_has_speaker,
+    )
+
+    assert v_pred.shape == x_t.shape
+    assert duration_pred.shape == (batch_size,)
+    assert torch.isfinite(duration_pred).all()
 
 
 def test_character_model_sampling_runs_without_error(monkeypatch) -> None:

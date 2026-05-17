@@ -1,13 +1,13 @@
  #!/bin/bash
 
 INIT_CHECKPOINT="models/500m_v3.safetensors"
-OUTPUT_DIR="outputs/v3_zunsasa_07"
+OUTPUT_DIR="outputs/v3_zunsasa_07_lora"
 # MANIFEST="data/amitaro.jsonl"
 MANIFEST="data/zunda-sasa.jsonl"
 
  
  uv run train.py \
-    --config configs/train_500m_v3_speaker_inversion.yaml \
+    --config configs/train_500m_v3_lora.yaml \
     --manifest $MANIFEST \
     --init-checkpoint $INIT_CHECKPOINT \
     --output-dir $OUTPUT_DIR

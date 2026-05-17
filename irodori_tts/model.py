@@ -2004,7 +2004,8 @@ class TextToLatentRFDiT(nn.Module):
         character_mask: torch.Tensor | None = None,
         detach_condition: bool = True,
     ) -> torch.Tensor:
-        if self.duration_predictor is None:
+        duration_predictor = self._duration_predictor_for_forward()
+        if duration_predictor is None:
             raise RuntimeError("Duration predictor is disabled for this model.")
         if duration_features.ndim != 2:
             raise ValueError(
@@ -2025,12 +2026,12 @@ class TextToLatentRFDiT(nn.Module):
                     f"character_state must have shape (B, S, D), got {tuple(character_state.shape)}"
                 )
             if (
-                self.duration_predictor.speaker_dim is not None
-                and character_state.shape[-1] != self.duration_predictor.speaker_dim
+                duration_predictor.speaker_dim is not None
+                and character_state.shape[-1] != duration_predictor.speaker_dim
             ):
                 raise ValueError(
                     "character_state last dim must match duration predictor speaker_dim "
-                    f"({self.duration_predictor.speaker_dim}), got {character_state.shape[-1]}"
+                    f"({duration_predictor.speaker_dim}), got {character_state.shape[-1]}"
                 )
             if character_mask is None:
                 character_mask = torch.ones(
@@ -2045,9 +2046,9 @@ class TextToLatentRFDiT(nn.Module):
                     character_state,
                     character_mask,
                 )
-            if duration_has_speaker is None and self.duration_predictor.speaker_dim is not None:
+            if duration_has_speaker is None and duration_predictor.speaker_dim is not None:
                 duration_has_speaker = duration_mask[:, 0]
-        if duration_has_speaker is None and self.duration_predictor.speaker_dim is not None:
+        if duration_has_speaker is None and duration_predictor.speaker_dim is not None:
             duration_has_speaker = torch.zeros(
                 (text_state.shape[0],),
                 dtype=torch.bool,
@@ -2058,7 +2059,7 @@ class TextToLatentRFDiT(nn.Module):
         text_state_for_model = text_state.detach()
         if detach_condition and duration_state_for_model is not None:
             duration_state_for_model = duration_state_for_model.detach()
-        pred = self.duration_predictor(
+        pred = duration_predictor(
             text_state=text_state_for_model,
             text_mask=text_mask,
             aux_features=duration_features,
@@ -2067,6 +2068,28 @@ class TextToLatentRFDiT(nn.Module):
             has_speaker=duration_has_speaker,
         )
         return pred.float()
+
+    def _duration_predictor_for_forward(self) -> nn.Module | None:
+        module = self.duration_predictor
+        if module is None:
+            return None
+
+        # PEFT wraps `modules_to_save` entries in ModulesToSaveWrapper, whose
+        # forward signature requires a positional `x`. DurationPredictor uses
+        # keyword-only arguments, so call the active saved copy directly.
+        modules_to_save = getattr(module, "modules_to_save", None)
+        active_adapters = getattr(module, "active_adapters", None)
+        if modules_to_save is not None and active_adapters:
+            active_adapter = active_adapters[0]
+            if active_adapter in modules_to_save:
+                return modules_to_save[active_adapter]
+
+        if bool(getattr(module, "disable_adapters", False)):
+            original_module = getattr(module, "original_module", None)
+            if isinstance(original_module, nn.Module):
+                return original_module
+
+        return module
 
     @property
     def device(self) -> torch.device:

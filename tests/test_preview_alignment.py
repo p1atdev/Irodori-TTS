@@ -79,6 +79,7 @@ def test_preview_sample_to_sampling_request_uses_normalized_text_for_length_esti
     assert request.duration_scale == 1.0
     assert request.seed == 123
     assert request.trim_tail is True
+    assert request.no_ref is True
 
 
 def test_preview_sample_to_sampling_request_can_use_duration_predictor() -> None:
@@ -94,6 +95,15 @@ def test_preview_sample_to_sampling_request_can_use_duration_predictor() -> None
     assert normalized_text == "テスト?"
     assert request.seconds is None
     assert request.duration_scale == 1.25
+
+
+def test_preview_sample_to_sampling_request_uses_ref_when_configured() -> None:
+    request, _ = train.preview_sample_to_sampling_request(
+        train.PreviewSampleConfig(text="テスト", ref_wav="ref.wav")
+    )
+
+    assert request.ref_wav == "ref.wav"
+    assert request.no_ref is False
 
 
 def test_preview_sample_to_sampling_request_allows_trim_tail_false() -> None:

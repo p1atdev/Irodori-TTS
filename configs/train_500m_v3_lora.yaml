@@ -29,49 +29,123 @@ model:
   duration_speaker_fusion: adarn_zero
 
 train:
-  batch_size: 80
+  train_mode: rf
+
+  batch_size: 16
   gradient_accumulation_steps: 1
-  num_workers: 16
+  gradient_checkpointing: true
+  num_workers: 8
   dataloader_persistent_workers: true
   dataloader_prefetch_factor: 4
   allow_tf32: true
   compile_model: false
   precision: bf16
-  optimizer: adamw
-  learning_rate: 0.0001
-  weight_decay: 0.01
-  lr_scheduler: wsd
-  warmup_steps: 1000
-  stable_steps: 24000
-  min_lr_scale: 0.01
-  max_steps: 30000
+  #
+  optimizer: radam_schedule_free
+  learning_rate: 0.001
+  weight_decay: 0.0
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_eps: 0.00000001
+  lr_scheduler: none
+  # warmup_steps: 1000
+  # stable_steps: 24000
+  # min_lr_scale: 0.01
+  
+  max_steps: 3000
+
   max_text_len: 256
-  text_condition_dropout: 0.1
-  speaker_condition_dropout: 0.1
+  text_condition_dropout: 0.0
+  speaker_condition_dropout: 0.0
   timestep_stratified: true
   max_latent_steps: 750
   fixed_target_latent_steps:
   fixed_target_full_mask: false
   rf_loss_mode: utterance_mean
-  duration_loss_weight: 0.1
-  duration_speaker_dropout: 0.1
+
+  duration_loss_weight: 0.0
+  duration_speaker_dropout: 0.0
   duration_huber_delta: 0.1
-  log_every: 100
-  save_every: 1000
+
+  log_every: 20
+  save_every: 250
   checkpoint_best_n: 5
-  wandb_enabled: false
-  wandb_project:
+  valid_ratio: 0.0005
+  valid_every: 500
+
+  speaker_similarity_valid_samples: 4
+  speaker_similarity_num_steps: 20
+  speaker_similarity_model: speechbrain/spkrec-ecapa-voxceleb
+  speaker_similarity_device:
+
+  ema_enabled: false
+  wandb_enabled: true
+  wandb_project: irodori-tts-speaker-inversion
   wandb_entity:
   wandb_run_name:
   wandb_mode: online
   ddp_find_unused_parameters: false
-  valid_ratio: 0.0005
-  valid_every: 1000
+
+  # LoRA
   lora_enabled: true
-  lora_r: 16
-  lora_alpha: 32
+  lora_r: 4
+  lora_alpha: 1
   lora_dropout: 0.0
   lora_bias: none
-  lora_target_modules: diffusion_attn
+  lora_target_modules: diffusion_attn # speaker_attn_mlp #
   lora_modules_to_save: auto
   seed: 0
+
+  preview_every: 100
+  preview_samples:
+    - text: その森には、古い言い伝えがありました。月が最も高く昇る夜、静かに耳を澄ませば、風の歌声が聞こえるというのです。
+      num_steps: 20
+      use_duration_predictor: true
+      duration_scale: 1.0
+      cfg_guidance_mode: independent # joint, alternating
+      cfg_scale_text: 3.0
+      cfg_scale_speaker: 4.0
+    - text: 吐く息は白く染まり、すぐに夜の闇へと溶けて消える。空から舞い散る雪は、まるで音のない祈りのようだ。
+      num_steps: 20
+      use_duration_predictor: true
+      duration_scale: 1.0
+      cfg_guidance_mode: independent # joint, alternating
+      cfg_scale_text: 3.0
+      cfg_scale_speaker: 4.0
+    - text: 潮風が、古い記憶の欠片を遠い岸辺へと運んでいく。足跡はすぐに波に飲まれ、ただ真っ白な砂浜だけが残された。
+      num_steps: 20
+      use_duration_predictor: true
+      duration_scale: 1.0
+      cfg_guidance_mode: independent # joint, alternating
+      cfg_scale_text: 3.0
+      cfg_scale_speaker: 4.0
+    - text: 遠くで鳴る夕暮れの鐘が、一日の終わりを告げている。家々の窓には、ぽつりぽつりと暖かな灯りがともり始めた。
+      num_steps: 20
+      use_duration_predictor: true
+      duration_scale: 1.0
+      cfg_guidance_mode: independent # joint, alternating
+      cfg_scale_text: 3.0
+      cfg_scale_speaker: 4.0
+    - text: 崩れかけたレンガの隙間から、名もなき花が顔を覗かせていた。かつての栄華はとうに過ぎ去り、今はただ風が通り過ぎるだけだ。
+      num_steps: 20
+      use_duration_predictor: true
+      duration_scale: 1.0
+      cfg_guidance_mode: independent # joint, alternating
+      cfg_scale_text: 3.0
+      cfg_scale_speaker: 4.0
+    - text: ページをめくるたび、古いインクの匂いがふわりと漂う。そこには、誰かが確かに生きた証が記されていた。
+      num_steps: 20
+      use_duration_predictor: true
+      duration_scale: 1.0
+      cfg_guidance_mode: independent # joint, alternating
+      cfg_scale_text: 3.0
+      cfg_scale_speaker: 4.0
+    - text: 木漏れ日が、苔むした石畳に金色の模様を描き出している。風が吹き抜けるたび、森全体が古い歌を口ずさむ。
+      num_steps: 20
+      use_duration_predictor: true
+      duration_scale: 1.0
+      cfg_guidance_mode: independent # joint, alternating
+      cfg_scale_text: 3.0
+      cfg_scale_speaker: 4.0
+    
+
