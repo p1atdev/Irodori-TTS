@@ -260,6 +260,45 @@ def test_prepare_reference_latent_trims_reference_audio_and_latent(monkeypatch) 
     assert any("Trimming reference latent" in message for message in messages)
 
 
+def test_prepare_speaker_embedding_condition_loads_embedding(tmp_path: Path) -> None:
+    model_cfg = make_model_config(use_caption_condition=False)
+    path = tmp_path / "speaker_embedding.pt"
+    torch.save(
+        {
+            "speaker_embedding": torch.ones(3, model_cfg.speaker_dim),
+            "speaker_uncond_embedding": torch.zeros(3, model_cfg.speaker_dim),
+            "speaker_uncond_mode": "noise",
+        },
+        path,
+    )
+    messages: list[str] = []
+
+    state, mask, uncond_state, uncond_mask, uncond_mode = (
+        generation_core.prepare_speaker_embedding_condition(
+            request=generation_core.SamplingRequest(
+                text="hello",
+                speaker_embedding=str(path),
+            ),
+            model_cfg=model_cfg,
+            batch_size=2,
+            model_device=torch.device("cpu"),
+            model_dtype=torch.float32,
+            messages=messages,
+        )
+    )
+
+    assert state is not None
+    assert mask is not None
+    assert uncond_state is not None
+    assert uncond_mask is not None
+    assert state.shape == (2, 3, model_cfg.speaker_dim)
+    assert torch.equal(mask, torch.ones((2, 3), dtype=torch.bool))
+    assert torch.count_nonzero(uncond_state).item() == 0
+    assert torch.equal(uncond_mask, torch.ones((2, 3), dtype=torch.bool))
+    assert uncond_mode == "noise"
+    assert any("using speaker inversion embedding" in message for message in messages)
+
+
 def test_generate_from_components_uses_shared_runtime_rules(monkeypatch) -> None:
     model_cfg = make_model_config(use_caption_condition=True)
     model = TinyModel()

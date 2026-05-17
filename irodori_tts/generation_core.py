@@ -13,6 +13,7 @@ from .codec import DACVAECodec, patchify_latent, unpatchify_latent
 from .config import ModelConfig
 from .duration import build_duration_features
 from .rf import sample_euler_rf_cfg
+from .speaker_inversion import load_speaker_inversion_payload, speaker_inversion_batch_tensors
 from .text_normalization import normalize_text
 from .tokenizer import PretrainedTextTokenizer
 
@@ -34,6 +35,7 @@ class SamplingRequest:
     caption: str | None = None
     ref_wav: str | None = None
     ref_latent: str | None = None
+    speaker_embedding: str | None = None
     no_ref: bool = False
     ref_normalize_db: float | None = -16.0
     ref_ensure_max: bool = True
@@ -391,6 +393,42 @@ def prepare_reference_latent(
     return ref_latent_patched, ref_mask
 
 
+def prepare_speaker_embedding_condition(
+    *,
+    request: SamplingRequest,
+    model_cfg: ModelConfig,
+    batch_size: int,
+    model_device: torch.device,
+    model_dtype: torch.dtype,
+    messages: list[str],
+) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, str]:
+    if request.speaker_embedding is None:
+        return None, None, None, None, "mask"
+    if not model_cfg.use_speaker_condition:
+        messages.append(
+            "info: speaker conditioning is disabled for this checkpoint; ignoring speaker embedding."
+        )
+        return None, None, None, None, "mask"
+    if request.ref_wav is not None or request.ref_latent is not None or request.no_ref:
+        raise ValueError(
+            "speaker_embedding cannot be combined with ref_wav/ref_latent/no_ref. "
+            "Use exactly one speaker conditioning source."
+        )
+
+    payload = load_speaker_inversion_payload(request.speaker_embedding, model_cfg=model_cfg)
+    state, mask, uncond_state, uncond_mask, uncond_mode = speaker_inversion_batch_tensors(
+        payload,
+        batch_size=batch_size,
+        device=model_device,
+        dtype=model_dtype,
+    )
+    messages.append(
+        "info: using speaker inversion embedding "
+        f"{payload['source_path']} tokens={state.shape[1]} uncond_mode={uncond_mode}."
+    )
+    return state, mask, uncond_state, uncond_mask, uncond_mode
+
+
 def _decode_generated_audios(
     *,
     latent: torch.Tensor,
@@ -594,15 +632,39 @@ def generate_from_components(
 
         t0 = measure_start(model_device, resolved_codec_device)
         msg_count_before_ref = len(messages)
-        ref_latent, ref_mask = prepare_reference_latent(
+        speaker_state_override = None
+        speaker_mask_override = None
+        speaker_uncond_state = None
+        speaker_uncond_mask = None
+        speaker_uncond_mode = "mask"
+        (
+            speaker_state_override,
+            speaker_mask_override,
+            speaker_uncond_state,
+            speaker_uncond_mask,
+            speaker_uncond_mode,
+        ) = prepare_speaker_embedding_condition(
             request=request,
-            codec=codec,
             model_cfg=model_cfg,
             batch_size=batch_size,
             model_device=model_device,
             model_dtype=next(model.parameters()).dtype,
             messages=messages,
         )
+        has_internal_speaker_inversion = getattr(model, "speaker_inversion", None) is not None
+        if speaker_state_override is not None or has_internal_speaker_inversion:
+            ref_latent = None
+            ref_mask = None
+        else:
+            ref_latent, ref_mask = prepare_reference_latent(
+                request=request,
+                codec=codec,
+                model_cfg=model_cfg,
+                batch_size=batch_size,
+                model_device=model_device,
+                model_dtype=next(model.parameters()).dtype,
+                messages=messages,
+            )
         stage_sec = measure_end(t0, model_device, resolved_codec_device)
         stage_timings.append(("prepare_reference", stage_sec))
         for msg in messages[msg_count_before_ref:]:
@@ -635,6 +697,14 @@ def generate_from_components(
             )
             if model_cfg.use_speaker_condition and ref_mask is not None:
                 has_duration_reference = ref_mask.any(dim=1)
+            elif model_cfg.use_speaker_condition and speaker_mask_override is not None:
+                has_duration_reference = speaker_mask_override.any(dim=1)
+            elif model_cfg.use_speaker_condition and has_internal_speaker_inversion:
+                has_duration_reference = torch.ones(
+                    (batch_size,),
+                    dtype=torch.bool,
+                    device=model_device,
+                )
             elif model_cfg.use_character_condition:
                 has_character_reference = (
                     request.character_image is not None and str(request.character_image).strip()
@@ -669,6 +739,11 @@ def generate_from_components(
                 speaker_mask=ref_mask,
                 caption_input_ids=caption_ids,
                 caption_mask=caption_mask,
+                speaker_state_override=speaker_state_override,
+                speaker_mask_override=speaker_mask_override,
+                speaker_uncond_state=speaker_uncond_state,
+                speaker_uncond_mask=speaker_uncond_mask,
+                speaker_uncond_mode=speaker_uncond_mode,
                 character_images=character_images,
             )
             pred_log_frames = model.predict_duration_log_frames(
@@ -739,6 +814,11 @@ def generate_from_components(
                 sequence_length=patched_steps,
                 caption_input_ids=caption_ids,
                 caption_mask=caption_mask,
+                speaker_state_override=speaker_state_override,
+                speaker_mask_override=speaker_mask_override,
+                speaker_uncond_state=speaker_uncond_state,
+                speaker_uncond_mask=speaker_uncond_mask,
+                speaker_uncond_mode=speaker_uncond_mode,
                 character_images=character_images,
                 num_steps=int(request.num_steps),
                 cfg_scale_text=cfg_scale_text,

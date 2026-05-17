@@ -13,8 +13,9 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import irodori_tts.image_encoder as image_encoder
 import train
-from irodori_tts.config import ModelConfig
+from irodori_tts.config import ModelConfig, TrainConfig
 from irodori_tts.model import TextToLatentRFDiT
+from irodori_tts.speaker_inversion import load_speaker_inversion_payload
 
 
 class DummyImageBackbone(nn.Module):
@@ -190,6 +191,41 @@ def test_apply_base_initialization_skips_character_copy_on_shape_mismatch(
     assert any("shape mismatch" in str(w.message) for w in caught)
     for block, before in zip(char_model.blocks, character_attn_before, strict=True):
         assert torch.equal(block.attention.wk_character.weight, before)
+
+
+def test_speaker_inversion_freeze_and_checkpoint_save(tmp_path: Path) -> None:
+    cfg = make_base_config()
+    model = TextToLatentRFDiT(cfg)
+    model.enable_speaker_inversion(
+        num_tokens=4,
+        init_std=0.01,
+        uncond_mode="noise",
+        uncond_std=0.02,
+    )
+
+    trainable, frozen = train.freeze_for_speaker_inversion(model)
+    assert trainable == model.speaker_inversion.embedding.numel()
+    assert frozen > trainable
+    assert model.speaker_inversion.embedding.requires_grad
+    assert not model.text_encoder.text_embedding.weight.requires_grad
+
+    path = tmp_path / "speaker_embedding.pt"
+    train.save_checkpoint(
+        path,
+        model=model,
+        optimizer=torch.optim.AdamW([model.speaker_inversion.embedding], lr=1e-3),
+        scheduler=None,
+        step=7,
+        model_cfg=cfg,
+        train_cfg=TrainConfig(speaker_inversion_enabled=True),
+    )
+
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    assert "model" not in payload
+    assert payload["step"] == 7
+    assert payload["speaker_embedding"].shape == (4, cfg.speaker_dim)
+    loaded = load_speaker_inversion_payload(path, model_cfg=cfg)
+    assert loaded["speaker_uncond_mode"] == "noise"
 
 
 def _fake_source_state(num_blocks: int, prefix: str, dim: int, in_dim: int) -> dict:

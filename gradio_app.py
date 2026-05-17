@@ -101,6 +101,38 @@ def _resolve_ref_wav(uploaded_audio: str | None) -> str | None:
     return None
 
 
+def _coerce_gradio_file_path(value: object) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        return text or None
+    if isinstance(value, dict):
+        for key in ("path", "name"):
+            candidate = value.get(key)
+            if candidate is not None and str(candidate).strip():
+                return str(candidate)
+        return None
+    candidate = getattr(value, "name", None)
+    if candidate is not None and str(candidate).strip():
+        return str(candidate)
+    text = str(value).strip()
+    return text or None
+
+
+def _resolve_speaker_embedding(
+    uploaded_embedding: object,
+    speaker_embedding_path_raw: str | None,
+) -> str | None:
+    uploaded_path = _coerce_gradio_file_path(uploaded_embedding)
+    raw_path = None
+    if speaker_embedding_path_raw is not None and str(speaker_embedding_path_raw).strip():
+        raw_path = str(speaker_embedding_path_raw).strip()
+    if uploaded_path is not None and raw_path is not None:
+        raise ValueError("Use either speaker embedding upload or speaker embedding path, not both.")
+    return uploaded_path if uploaded_path is not None else raw_path
+
+
 def _resolve_checkpoint_path(raw_checkpoint: str) -> str:
     checkpoint = str(raw_checkpoint).strip()
     if checkpoint == "":
@@ -172,6 +204,8 @@ def _run_generation(
     codec_precision: str,
     text: str,
     uploaded_audio: str | None,
+    uploaded_speaker_embedding: object,
+    speaker_embedding_path_raw: str,
     num_steps: int,
     num_candidates: int,
     seed_raw: str,
@@ -223,7 +257,13 @@ def _run_generation(
     manual_seconds = _parse_optional_float(seconds_raw, "seconds")
 
     ref_wav = _resolve_ref_wav(uploaded_audio=uploaded_audio)
-    no_ref = ref_wav is None
+    speaker_embedding = _resolve_speaker_embedding(
+        uploaded_embedding=uploaded_speaker_embedding,
+        speaker_embedding_path_raw=speaker_embedding_path_raw,
+    )
+    if ref_wav is not None and speaker_embedding is not None:
+        raise ValueError("Reference audio and speaker embedding are mutually exclusive.")
+    no_ref = ref_wav is None and speaker_embedding is None
     ref_normalize_db = -16.0
     ref_ensure_max = True
 
@@ -249,12 +289,15 @@ def _run_generation(
             requested_candidates,
         )
     )
+    if speaker_embedding is not None:
+        stdout_log(f"[gradio] speaker_embedding: {speaker_embedding}")
 
     result = runtime.synthesize(
         SamplingRequest(
             text=str(text),
             ref_wav=ref_wav,
             ref_latent=None,
+            speaker_embedding=speaker_embedding,
             no_ref=bool(no_ref),
             ref_normalize_db=ref_normalize_db,
             ref_ensure_max=bool(ref_ensure_max),
@@ -381,10 +424,23 @@ def build_ui() -> gr.Blocks:
                 elem_id="irodori-text-input",
             )
             build_emoji_palette(text, open=False)
-        uploaded_audio = gr.Audio(
-            label="Reference Audio Upload (optional, blank = no-reference mode)",
-            type="filepath",
-        )
+        with gr.Row():
+            uploaded_audio = gr.Audio(
+                label="Reference Audio Upload (optional)",
+                type="filepath",
+                scale=1,
+            )
+            uploaded_speaker_embedding = gr.File(
+                label="Speaker Embedding Upload (.pt, optional)",
+                type="filepath",
+                file_count="single",
+                scale=1,
+            )
+            speaker_embedding_path_raw = gr.Textbox(
+                label="Speaker Embedding Path (.pt, optional)",
+                value="",
+                scale=1,
+            )
 
         with gr.Accordion("Sampling", open=True):
             with gr.Row():
@@ -494,6 +550,8 @@ def build_ui() -> gr.Blocks:
                 codec_precision,
                 text,
                 uploaded_audio,
+                uploaded_speaker_embedding,
+                speaker_embedding_path_raw,
                 num_steps,
                 num_candidates,
                 seed_raw,

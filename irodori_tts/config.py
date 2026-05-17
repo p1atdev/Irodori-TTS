@@ -181,6 +181,10 @@ class TrainConfig:
     ema_decay: float = 0.9999
     valid_ratio: float = 0.0
     valid_every: int = 0
+    speaker_similarity_valid_samples: int = 0
+    speaker_similarity_num_steps: int = 20
+    speaker_similarity_model: str = "speechbrain/spkrec-ecapa-voxceleb"
+    speaker_similarity_device: str | None = None
     progress: bool = True
     progress_all_ranks: bool = False
     precision: str = "bf16"
@@ -194,6 +198,12 @@ class TrainConfig:
     max_character_patches: int | None = None
     character_unconditional_fill: str = "zero"
     speaker_condition_dropout: float = 0.1
+    speaker_inversion_enabled: bool = False
+    speaker_inversion_tokens: int = 16
+    speaker_inversion_init_std: float = 0.02
+    speaker_inversion_init_embedding: str | None = None
+    speaker_inversion_uncond_mode: str = "mask"
+    speaker_inversion_uncond_std: float = 1.0
     max_latent_steps: int = 750
     fixed_target_latent_steps: int | None = 750
     fixed_target_full_mask: bool = True

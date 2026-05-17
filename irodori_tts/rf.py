@@ -126,6 +126,11 @@ def sample_euler_rf_cfg(
     sequence_length: int,
     caption_input_ids: torch.Tensor | None = None,
     caption_mask: torch.Tensor | None = None,
+    speaker_state_override: torch.Tensor | None = None,
+    speaker_mask_override: torch.Tensor | None = None,
+    speaker_uncond_state: torch.Tensor | None = None,
+    speaker_uncond_mask: torch.Tensor | None = None,
+    speaker_uncond_mode: str = "mask",
     character_images: torch.Tensor | None = None,
     character_mask: torch.Tensor | None = None,
     num_steps: int = 40,
@@ -229,6 +234,11 @@ def sample_euler_rf_cfg(
         speaker_mask=ref_mask,
         caption_input_ids=caption_input_ids,
         caption_mask=caption_mask,
+        speaker_state_override=speaker_state_override,
+        speaker_mask_override=speaker_mask_override,
+        speaker_uncond_state=speaker_uncond_state,
+        speaker_uncond_mask=speaker_uncond_mask,
+        speaker_uncond_mode=speaker_uncond_mode,
         character_images=character_images,
         character_mask=character_mask,
         use_character_noisy_condition=True,
@@ -243,8 +253,35 @@ def sample_euler_rf_cfg(
             raise RuntimeError(
                 "Speaker conditioning is enabled but encoded speaker state is missing."
             )
-        speaker_state_uncond = torch.zeros_like(speaker_state_cond)
-        speaker_mask_uncond = torch.zeros_like(speaker_mask_cond)
+        effective_speaker_uncond_mode = str(speaker_uncond_mode).strip().lower()
+        if speaker_uncond_state is None and hasattr(model, "_speaker_inversion_uncond"):
+            (
+                speaker_uncond_state,
+                speaker_uncond_mask,
+                effective_speaker_uncond_mode,
+            ) = model._speaker_inversion_uncond(
+                batch_size=batch_size,
+                device=speaker_state_cond.device,
+                dtype=speaker_state_cond.dtype,
+            )
+        if effective_speaker_uncond_mode == "noise":
+            if speaker_uncond_state is None:
+                speaker_state_uncond = torch.zeros_like(speaker_state_cond)
+            else:
+                speaker_state_uncond = speaker_uncond_state.to(
+                    device=speaker_state_cond.device,
+                    dtype=speaker_state_cond.dtype,
+                )
+            if speaker_uncond_mask is None:
+                speaker_mask_uncond = torch.ones_like(speaker_mask_cond)
+            else:
+                speaker_mask_uncond = speaker_uncond_mask.to(
+                    device=speaker_mask_cond.device,
+                    dtype=torch.bool,
+                )
+        else:
+            speaker_state_uncond = torch.zeros_like(speaker_state_cond)
+            speaker_mask_uncond = torch.zeros_like(speaker_mask_cond)
 
     caption_state_uncond = None
     caption_mask_uncond = None

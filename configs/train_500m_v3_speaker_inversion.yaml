@@ -1,0 +1,169 @@
+# Speaker Inversion training config.
+#
+# Usage:
+#   uv run train.py \
+#     --config configs/train_500m_v3_speaker_inversion.yaml \
+#     --manifest path/to/manifest.jsonl \
+#     --init-checkpoint path/to/base_checkpoint.pt \
+#     --output-dir outputs/speaker_inversion/name
+#
+# The base checkpoint must be speaker-conditioned and compatible with this
+# model section. Training saves embedding-only .pt checkpoints that can be used
+# at inference with:
+#   uv run infer.py --checkpoint path/to/base_checkpoint.safetensors \
+#     --speaker-embedding outputs/speaker_inversion/name/checkpoint_final.pt ...
+
+model:
+  latent_dim: 32
+  latent_patch_size: 1
+  text_vocab_size: 99574
+  text_tokenizer_repo: llm-jp/llm-jp-3-150m
+  model_dim: 1280
+  num_layers: 12
+  num_heads: 20
+  mlp_ratio: 2.875
+  text_mlp_ratio: 2.6
+  speaker_mlp_ratio: 2.6
+  text_dim: 512
+  text_layers: 10
+  text_heads: 8
+  speaker_dim: 768
+  speaker_layers: 8
+  speaker_heads: 12
+  speaker_patch_size: 1
+  timestep_embed_dim: 512
+  adaln_rank: 192
+  use_duration_predictor: true
+  duration_aux_dim: 14
+  duration_hidden_dim: 1024
+  duration_layers: 3
+  duration_dropout: 0.1
+  duration_attention_heads: 8
+  duration_architecture: token_sum_adarn_zero_no_aux
+  duration_token_init_frames: 9.0
+  duration_speaker_fusion: adarn_zero
+
+train:
+  train_mode: rf
+  # 
+  speaker_inversion_enabled: true
+  speaker_inversion_tokens: 16
+  speaker_inversion_init_std: 0.02
+  # Optional: continue from an existing embedding-only checkpoint.
+  speaker_inversion_init_embedding:
+  # mask: unconditional branch attends to no speaker tokens.
+  # noise: unconditional branch attends to fixed random speaker tokens.
+  speaker_inversion_uncond_mode: mask
+  speaker_inversion_uncond_std: 1.0
+
+  batch_size: 16
+  gradient_accumulation_steps: 1
+  num_workers: 8
+  dataloader_persistent_workers: true
+  dataloader_prefetch_factor: 4
+  allow_tf32: true
+  compile_model: false
+  gradient_checkpointing: false
+  precision: bf16
+
+  optimizer: radam_schedule_free
+  learning_rate: 0.001
+  weight_decay: 0.0
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_eps: 0.00000001
+  lr_scheduler: none
+  # warmup_steps: 0
+  # min_lr_scale: 0.1
+  # 
+  max_steps: 5000
+
+  max_text_len: 256
+  text_condition_dropout: 0.0
+  speaker_condition_dropout: 0.0
+  caption_condition_dropout: 0.0
+  character_condition_dropout: 0.0
+  timestep_stratified: true
+  max_latent_steps: 750
+  fixed_target_latent_steps:
+  fixed_target_full_mask: false
+  rf_loss_mode: utterance_mean
+
+  duration_loss_weight: 0.01
+  duration_speaker_dropout: 0.0
+  duration_huber_delta: 0.1
+
+  log_every: 20
+  save_every: 250
+  checkpoint_best_n: 5
+  valid_ratio: 0.0005
+  valid_every: 250
+  # Validation speaker similarity is expensive because it samples audio.
+  # Keep this small and increase only when validation speed is acceptable.
+  speaker_similarity_valid_samples: 4
+  speaker_similarity_num_steps: 20
+  speaker_similarity_model: speechbrain/spkrec-ecapa-voxceleb
+  speaker_similarity_device:
+
+  ema_enabled: false
+  wandb_enabled: true
+  wandb_project: irodori-tts-speaker-inversion
+  wandb_entity:
+  wandb_run_name:
+  wandb_mode: online
+  ddp_find_unused_parameters: false
+  seed: 0
+
+  # Preview uses the learned embedding automatically while this training run is active.
+  preview_every: 100
+  preview_samples:
+    - text: その森には、古い言い伝えがありました。月が最も高く昇る夜、静かに耳を澄ませば、風の歌声が聞こえるというのです。
+      num_steps: 20
+      use_duration_predictor: true
+      duration_scale: 1.0
+      cfg_guidance_mode: independent # joint, alternating
+      cfg_scale_text: 3.0
+      cfg_scale_speaker: 4.0
+    - text: 吐く息は白く染まり、すぐに夜の闇へと溶けて消える。空から舞い散る雪は、まるで音のない祈りのようだ。
+      num_steps: 20
+      use_duration_predictor: true
+      duration_scale: 1.0
+      cfg_guidance_mode: independent # joint, alternating
+      cfg_scale_text: 3.0
+      cfg_scale_speaker: 4.0
+    - text: 潮風が、古い記憶の欠片を遠い岸辺へと運んでいく。足跡はすぐに波に飲まれ、ただ真っ白な砂浜だけが残された。
+      num_steps: 20
+      use_duration_predictor: true
+      duration_scale: 1.0
+      cfg_guidance_mode: independent # joint, alternating
+      cfg_scale_text: 3.0
+      cfg_scale_speaker: 4.0
+    - text: 遠くで鳴る夕暮れの鐘が、一日の終わりを告げている。家々の窓には、ぽつりぽつりと暖かな灯りがともり始めた。
+      num_steps: 20
+      use_duration_predictor: true
+      duration_scale: 1.0
+      cfg_guidance_mode: independent # joint, alternating
+      cfg_scale_text: 3.0
+      cfg_scale_speaker: 4.0
+    - text: 崩れかけたレンガの隙間から、名もなき花が顔を覗かせていた。かつての栄華はとうに過ぎ去り、今はただ風が通り過ぎるだけだ。
+      num_steps: 20
+      use_duration_predictor: true
+      duration_scale: 1.0
+      cfg_guidance_mode: independent # joint, alternating
+      cfg_scale_text: 3.0
+      cfg_scale_speaker: 4.0
+    - text: ページをめくるたび、古いインクの匂いがふわりと漂う。そこには、誰かが確かに生きた証が記されていた。
+      num_steps: 20
+      use_duration_predictor: true
+      duration_scale: 1.0
+      cfg_guidance_mode: independent # joint, alternating
+      cfg_scale_text: 3.0
+      cfg_scale_speaker: 4.0
+    - text: 木漏れ日が、苔むした石畳に金色の模様を描き出している。風が吹き抜けるたび、森全体が古い歌を口ずさむ。
+      num_steps: 20
+      use_duration_predictor: true
+      duration_scale: 1.0
+      cfg_guidance_mode: independent # joint, alternating
+      cfg_scale_text: 3.0
+      cfg_scale_speaker: 4.0
+    

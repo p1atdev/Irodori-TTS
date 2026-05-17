@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import math
 import os
 import random
 import re
@@ -17,6 +18,7 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+import torchaudio
 import wandb
 from safetensors import safe_open
 from safetensors.torch import load_file as load_safetensors_file
@@ -24,7 +26,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 from transformers import AutoConfig, AutoModel
 
-from irodori_tts.codec import DACVAECodec
+from irodori_tts.codec import DACVAECodec, unpatchify_latent
 from irodori_tts.config import (
     ModelConfig,
     RegexModule,
@@ -64,8 +66,16 @@ from irodori_tts.progress import TrainProgress
 from irodori_tts.rf import (
     rf_interpolate,
     rf_velocity_target,
+    sample_euler_rf_cfg,
     sample_logit_normal_t,
     sample_stratified_logit_normal_t,
+)
+from irodori_tts.speaker_inversion import (
+    SPEAKER_EMBEDDING_KEY,
+    SPEAKER_INVERSION_UNCOND_MODES,
+    SPEAKER_UNCOND_EMBEDDING_KEY,
+    load_speaker_inversion_payload,
+    save_speaker_inversion_checkpoint,
 )
 from irodori_tts.tokenizer import PretrainedTextTokenizer
 
@@ -156,6 +166,18 @@ def save_checkpoint(
     extra_state: dict | None = None,
 ) -> None:
     path = Path(path)
+    if train_cfg.speaker_inversion_enabled:
+        save_speaker_inversion_checkpoint(
+            path,
+            model=model,
+            model_cfg=model_cfg,
+            train_cfg=train_cfg,
+            step=step,
+            base_init=base_init,
+            extra_state=extra_state,
+        )
+        return
+
     if train_config_uses_lora(train_cfg):
         if model_state_dict is not None:
             raise ValueError("LoRA checkpoint saving does not support model_state_dict override.")
@@ -1038,6 +1060,19 @@ def freeze_for_duration_only(model: torch.nn.Module) -> tuple[int, int]:
     return trainable_params, frozen_params
 
 
+def freeze_for_speaker_inversion(model: torch.nn.Module) -> tuple[int, int]:
+    trainable_params = 0
+    frozen_params = 0
+    for key, param in model.named_parameters():
+        if key.startswith("speaker_inversion."):
+            param.requires_grad_(True)
+            trainable_params += param.numel()
+        else:
+            param.requires_grad_(False)
+            frozen_params += param.numel()
+    return trainable_params, frozen_params
+
+
 def validate_checkpoint_upgrade_partial_load(
     checkpoint_path: Path,
     missing_keys: list[str],
@@ -1752,20 +1787,164 @@ def run_preview(
         model.train()
 
 
+class SpeakerSimilarityEvaluator:
+    """SpeechBrain ECAPA-TDNN cosine similarity helper for validation samples."""
+
+    def __init__(
+        self,
+        *,
+        source: str,
+        device: torch.device,
+        sample_rate: int = 16000,
+    ) -> None:
+        try:
+            from speechbrain.inference.classifiers import EncoderClassifier
+        except ImportError:
+            from speechbrain.pretrained import EncoderClassifier
+
+        self.device = torch.device(device)
+        self.sample_rate = int(sample_rate)
+        self.classifier = EncoderClassifier.from_hparams(
+            source=str(source),
+            run_opts={"device": str(self.device)},
+        )
+        self.classifier.eval()
+
+    def _prepare_waveform(self, audio: torch.Tensor, sample_rate: int) -> torch.Tensor:
+        wav = audio.detach().float()
+        if wav.ndim == 2:
+            if wav.shape[0] == 1:
+                wav = wav[0]
+            elif wav.shape[1] == 1:
+                wav = wav[:, 0]
+            else:
+                wav = wav.mean(dim=0)
+        elif wav.ndim != 1:
+            raise ValueError(f"Expected audio shape (T), (1,T), or (T,1), got {tuple(wav.shape)}")
+        if int(sample_rate) != self.sample_rate:
+            wav = torchaudio.functional.resample(wav, int(sample_rate), self.sample_rate)
+        return wav.to(self.device).unsqueeze(0)
+
+    @torch.inference_mode()
+    def embedding(self, audio: torch.Tensor, sample_rate: int) -> torch.Tensor:
+        wav = self._prepare_waveform(audio, sample_rate)
+        emb = self.classifier.encode_batch(wav)
+        return emb.squeeze().float()
+
+    @torch.inference_mode()
+    def cosine_similarity(
+        self,
+        *,
+        generated_audio: torch.Tensor,
+        target_audio: torch.Tensor,
+        sample_rate: int,
+    ) -> float:
+        generated = self.embedding(generated_audio, sample_rate)
+        target = self.embedding(target_audio, sample_rate)
+        return float(F.cosine_similarity(generated.flatten(), target.flatten(), dim=0).item())
+
+
+def _accumulate_validation_speaker_similarity(
+    *,
+    sampling_model,
+    batch: dict,
+    text_ids: torch.Tensor,
+    text_mask: torch.Tensor,
+    caption_ids: torch.Tensor | None,
+    caption_mask: torch.Tensor | None,
+    character_images: torch.Tensor | None,
+    ref_latent: torch.Tensor | None,
+    ref_mask: torch.Tensor | None,
+    train_cfg: TrainConfig,
+    model_cfg: ModelConfig,
+    codec: DACVAECodec,
+    evaluator: SpeakerSimilarityEvaluator,
+    totals: torch.Tensor,
+    device: torch.device,
+    use_bf16: bool,
+) -> None:
+    limit = int(train_cfg.speaker_similarity_valid_samples)
+    current_count = int(totals[1].item())
+    if limit <= 0 or current_count >= limit:
+        return
+    if train_cfg.train_mode == "duration_only":
+        return
+
+    remaining = limit - current_count
+    batch_size = min(int(text_ids.shape[0]), remaining)
+    if batch_size <= 0:
+        return
+
+    target_latent = batch["latent"][:batch_size].to(device, non_blocking=True)
+    num_frames = batch["num_frames"][:batch_size].to(device, non_blocking=True)
+    max_frames = int(num_frames.max().item())
+    if max_frames <= 0:
+        return
+
+    latent_patch_size = int(model_cfg.latent_patch_size)
+    sequence_length = max(1, math.ceil(max_frames / latent_patch_size))
+    sim_caption_ids = None if caption_ids is None else caption_ids[:batch_size]
+    sim_caption_mask = None if caption_mask is None else caption_mask[:batch_size]
+    sim_character_images = None if character_images is None else character_images[:batch_size]
+    sim_ref_latent = None if ref_latent is None else ref_latent[:batch_size]
+    sim_ref_mask = None if ref_mask is None else ref_mask[:batch_size]
+
+    seed = int(train_cfg.seed) + current_count
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16) if use_bf16 else nullcontext():
+        generated_patched = sample_euler_rf_cfg(
+            model=sampling_model,
+            text_input_ids=text_ids[:batch_size],
+            text_mask=text_mask[:batch_size],
+            ref_latent=sim_ref_latent,
+            ref_mask=sim_ref_mask,
+            sequence_length=sequence_length,
+            caption_input_ids=sim_caption_ids,
+            caption_mask=sim_caption_mask,
+            character_images=sim_character_images,
+            num_steps=int(train_cfg.speaker_similarity_num_steps),
+            seed=seed,
+            cfg_guidance_mode="independent",
+        )
+    generated_latent = unpatchify_latent(
+        generated_patched,
+        patch_size=latent_patch_size,
+        latent_dim=int(model_cfg.latent_dim),
+    )[:, :max_frames]
+    target_latent = target_latent[:, :max_frames]
+
+    generated_audio = codec.decode_latent(generated_latent).detach().cpu()
+    target_audio = codec.decode_latent(target_latent).detach().cpu()
+    hop_length = int(codec.model.hop_length)
+    for i in range(batch_size):
+        frame_count = int(num_frames[i].item())
+        sample_count = max(1, frame_count * hop_length)
+        similarity = evaluator.cosine_similarity(
+            generated_audio=generated_audio[i, :, :sample_count],
+            target_audio=target_audio[i, :, :sample_count],
+            sample_rate=int(codec.sample_rate),
+        )
+        totals[0] += float(similarity)
+        totals[1] += 1.0
+
+
 def run_validation(
     *,
     model,
+    sampling_model,
     loader: DataLoader,
     train_cfg: TrainConfig,
     device: torch.device,
     use_bf16: bool,
     distributed: bool,
+    speaker_similarity_codec: DACVAECodec | None = None,
+    speaker_similarity_evaluator: SpeakerSimilarityEvaluator | None = None,
 ) -> dict[str, float]:
     was_training = model.training
     model_cfg = model.module.cfg if isinstance(model, DDP) else model.cfg
     duration_only = train_cfg.train_mode == "duration_only"
     model.eval()
     totals = torch.zeros(12, device=device, dtype=torch.float64)
+    speaker_similarity_totals = torch.zeros(2, device=device, dtype=torch.float64)
 
     with torch.no_grad():
         for batch in loader:
@@ -1790,9 +1969,16 @@ def run_validation(
             ref_latent = None
             ref_mask = None
             if model_cfg.use_speaker_condition:
-                ref_latent = batch["ref_latent_patched"].to(device, non_blocking=True)
-                ref_mask = batch["ref_latent_mask_patched"].to(device, non_blocking=True)
-                has_speaker = batch["has_speaker"].to(device, non_blocking=True)
+                if train_cfg.speaker_inversion_enabled:
+                    has_speaker = torch.ones(
+                        (text_ids.shape[0],),
+                        dtype=torch.bool,
+                        device=device,
+                    )
+                else:
+                    ref_latent = batch["ref_latent_patched"].to(device, non_blocking=True)
+                    ref_mask = batch["ref_latent_mask_patched"].to(device, non_blocking=True)
+                    has_speaker = batch["has_speaker"].to(device, non_blocking=True)
             else:
                 has_speaker = None
 
@@ -1871,6 +2057,7 @@ def run_validation(
                         duration_features=duration_features,
                         duration_has_speaker=duration_has_speaker,
                         duration_only=True,
+                        detach_duration_condition=not train_cfg.speaker_inversion_enabled,
                     )
                     v_pred = None
                 elif model_cfg.use_duration_predictor:
@@ -1888,9 +2075,10 @@ def run_validation(
                         speaker_condition_dropout=speaker_condition_dropout,
                         duration_features=duration_features,
                         duration_has_speaker=duration_has_speaker,
+                        detach_duration_condition=not train_cfg.speaker_inversion_enabled,
                     )
                 else:
-                    if model_cfg.use_speaker_condition:
+                    if model_cfg.use_speaker_condition and not train_cfg.speaker_inversion_enabled:
                         ref_mask = ref_mask & use_speaker[:, None]
                         ref_latent = ref_latent * use_speaker[:, None, None].to(ref_latent.dtype)
                     v_pred = model(
@@ -1956,8 +2144,29 @@ def run_validation(
             totals[4] += float(num_frames.detach().float().mean().item()) * weight
             totals[5] += weight
 
+            if speaker_similarity_codec is not None and speaker_similarity_evaluator is not None:
+                _accumulate_validation_speaker_similarity(
+                    sampling_model=sampling_model,
+                    batch=batch,
+                    text_ids=text_ids,
+                    text_mask=text_mask,
+                    caption_ids=caption_ids,
+                    caption_mask=caption_mask,
+                    character_images=character_images_val,
+                    ref_latent=ref_latent,
+                    ref_mask=ref_mask,
+                    train_cfg=train_cfg,
+                    model_cfg=model_cfg,
+                    codec=speaker_similarity_codec,
+                    evaluator=speaker_similarity_evaluator,
+                    totals=speaker_similarity_totals,
+                    device=device,
+                    use_bf16=use_bf16,
+                )
+
     if distributed:
         dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+        dist.all_reduce(speaker_similarity_totals, op=dist.ReduceOp.SUM)
     denom = max(float(totals[5].item()), 1.0)
     metrics = {
         "loss": float(totals[0].item() / denom),
@@ -1988,9 +2197,36 @@ def run_validation(
                 "duration_samples_no_speaker": no_speaker_count,
             }
         )
+    speaker_similarity_count = max(float(speaker_similarity_totals[1].item()), 0.0)
+    if speaker_similarity_count > 0.0:
+        metrics["speaker_similarity"] = float(
+            speaker_similarity_totals[0].item() / speaker_similarity_count
+        )
+        metrics["speaker_similarity_samples"] = speaker_similarity_count
     if was_training:
         model.train()
     return metrics
+
+
+def append_speaker_similarity_message(message: str, metrics: dict[str, float]) -> str:
+    if "speaker_similarity" not in metrics:
+        return message
+    return message + " spk_sim={:.4f} n_spk_sim={:.0f}".format(
+        metrics["speaker_similarity"],
+        metrics["speaker_similarity_samples"],
+    )
+
+
+def add_speaker_similarity_wandb_metrics(
+    wandb_metrics: dict[str, float],
+    validation_metrics: dict[str, float],
+) -> None:
+    if "speaker_similarity" not in validation_metrics:
+        return
+    wandb_metrics["valid/speaker_similarity"] = validation_metrics["speaker_similarity"]
+    wandb_metrics["valid/speaker_similarity_samples"] = validation_metrics[
+        "speaker_similarity_samples"
+    ]
 
 
 def main() -> None:
@@ -2146,6 +2382,49 @@ def main() -> None:
         default=0.1,
         help="Probability of dropping speaker/reference conditioning during training.",
     )
+    speaker_inversion_group = parser.add_mutually_exclusive_group()
+    speaker_inversion_group.add_argument(
+        "--speaker-inversion",
+        dest="speaker_inversion_enabled",
+        action="store_true",
+        help="Train only learned speaker/style embedding tokens while freezing the base TTS model.",
+    )
+    speaker_inversion_group.add_argument(
+        "--no-speaker-inversion",
+        dest="speaker_inversion_enabled",
+        action="store_false",
+        help="Disable Speaker Inversion training.",
+    )
+    parser.set_defaults(speaker_inversion_enabled=None)
+    parser.add_argument(
+        "--speaker-inversion-tokens",
+        type=int,
+        default=None,
+        help="Number of learned speaker embedding tokens.",
+    )
+    parser.add_argument(
+        "--speaker-inversion-init-std",
+        type=float,
+        default=None,
+        help="Standard deviation for random initialization of learned speaker tokens.",
+    )
+    parser.add_argument(
+        "--speaker-inversion-init-embedding",
+        default=None,
+        help="Optional Speaker Inversion embedding .pt file to initialize from.",
+    )
+    parser.add_argument(
+        "--speaker-inversion-uncond-mode",
+        choices=sorted(SPEAKER_INVERSION_UNCOND_MODES),
+        default=None,
+        help="Unconditional speaker mode for Speaker Inversion CFG/dropout.",
+    )
+    parser.add_argument(
+        "--speaker-inversion-uncond-std",
+        type=float,
+        default=None,
+        help="Standard deviation for noise unconditional speaker tokens.",
+    )
     parser.add_argument(
         "--timestep-stratified",
         action="store_true",
@@ -2190,6 +2469,31 @@ def main() -> None:
         type=int,
         default=0,
         help=("Run validation every N training steps. Set <=0 to disable validation."),
+    )
+    parser.add_argument(
+        "--speaker-similarity-valid-samples",
+        type=int,
+        default=None,
+        help=(
+            "Generate up to N validation samples and log SpeechBrain ECAPA speaker cosine "
+            "similarity against target audio. 0 disables."
+        ),
+    )
+    parser.add_argument(
+        "--speaker-similarity-num-steps",
+        type=int,
+        default=None,
+        help="RF sampling steps used for validation speaker similarity generation.",
+    )
+    parser.add_argument(
+        "--speaker-similarity-model",
+        default=None,
+        help="SpeechBrain EncoderClassifier source for speaker similarity.",
+    )
+    parser.add_argument(
+        "--speaker-similarity-device",
+        default=None,
+        help="Device for the SpeechBrain speaker similarity model (defaults to training device).",
     )
     parser.add_argument(
         "--progress",
@@ -2396,6 +2700,30 @@ def main() -> None:
         train_cfg = replace(train_cfg, caption_condition_dropout=args.caption_condition_dropout)
     if cli_provided(raw_argv, "--speaker-condition-dropout"):
         train_cfg = replace(train_cfg, speaker_condition_dropout=args.speaker_condition_dropout)
+    if args.speaker_inversion_enabled is not None:
+        train_cfg = replace(
+            train_cfg,
+            speaker_inversion_enabled=bool(args.speaker_inversion_enabled),
+        )
+    if cli_provided(raw_argv, "--speaker-inversion-tokens"):
+        train_cfg = replace(train_cfg, speaker_inversion_tokens=args.speaker_inversion_tokens)
+    if cli_provided(raw_argv, "--speaker-inversion-init-std"):
+        train_cfg = replace(train_cfg, speaker_inversion_init_std=args.speaker_inversion_init_std)
+    if cli_provided(raw_argv, "--speaker-inversion-init-embedding"):
+        train_cfg = replace(
+            train_cfg,
+            speaker_inversion_init_embedding=args.speaker_inversion_init_embedding,
+        )
+    if cli_provided(raw_argv, "--speaker-inversion-uncond-mode"):
+        train_cfg = replace(
+            train_cfg,
+            speaker_inversion_uncond_mode=args.speaker_inversion_uncond_mode,
+        )
+    if cli_provided(raw_argv, "--speaker-inversion-uncond-std"):
+        train_cfg = replace(
+            train_cfg,
+            speaker_inversion_uncond_std=args.speaker_inversion_uncond_std,
+        )
     if cli_provided(raw_argv, "--timestep-stratified"):
         train_cfg = replace(train_cfg, timestep_stratified=True)
     if cli_provided(raw_argv, "--max-latent-steps"):
@@ -2426,6 +2754,20 @@ def main() -> None:
         train_cfg = replace(train_cfg, valid_ratio=args.valid_ratio)
     if cli_provided(raw_argv, "--valid-every"):
         train_cfg = replace(train_cfg, valid_every=args.valid_every)
+    if cli_provided(raw_argv, "--speaker-similarity-valid-samples"):
+        train_cfg = replace(
+            train_cfg,
+            speaker_similarity_valid_samples=args.speaker_similarity_valid_samples,
+        )
+    if cli_provided(raw_argv, "--speaker-similarity-num-steps"):
+        train_cfg = replace(
+            train_cfg,
+            speaker_similarity_num_steps=args.speaker_similarity_num_steps,
+        )
+    if cli_provided(raw_argv, "--speaker-similarity-model"):
+        train_cfg = replace(train_cfg, speaker_similarity_model=args.speaker_similarity_model)
+    if cli_provided(raw_argv, "--speaker-similarity-device"):
+        train_cfg = replace(train_cfg, speaker_similarity_device=args.speaker_similarity_device)
     if args.progress is not None:
         train_cfg = replace(train_cfg, progress=args.progress)
     if args.progress_all is not None:
@@ -2517,6 +2859,64 @@ def main() -> None:
             "speaker_condition_dropout must be in [0, 1], "
             f"got {train_cfg.speaker_condition_dropout}"
         )
+    if train_cfg.speaker_inversion_enabled:
+        if not model_cfg.use_speaker_condition:
+            raise ValueError(
+                "speaker_inversion_enabled=True requires a speaker-conditioned model config."
+            )
+        if args.init_checkpoint is None:
+            raise ValueError(
+                "speaker_inversion_enabled=True requires --init-checkpoint so the frozen "
+                "base TTS model is initialized from trained weights."
+            )
+        if args.resume is not None:
+            raise ValueError(
+                "speaker_inversion_enabled=True saves embedding-only checkpoints; "
+                "--resume full trainer state is not supported. Use "
+                "speaker_inversion_init_embedding to continue from a saved embedding."
+            )
+        if train_config_uses_lora(train_cfg):
+            raise ValueError("speaker_inversion_enabled=True does not support LoRA training.")
+        if train_cfg.trainable_modules is not None:
+            raise ValueError(
+                "speaker_inversion_enabled=True freezes the base model and does not support "
+                "trainable_modules."
+            )
+        if train_cfg.caption_warmup:
+            raise ValueError("speaker_inversion_enabled=True does not support caption_warmup.")
+        if train_cfg.ema_enabled:
+            raise ValueError("speaker_inversion_enabled=True does not support EMA checkpoints.")
+        if train_cfg.speaker_inversion_tokens <= 0:
+            raise ValueError(
+                f"speaker_inversion_tokens must be > 0, got {train_cfg.speaker_inversion_tokens}"
+            )
+        if train_cfg.speaker_inversion_init_std < 0:
+            raise ValueError(
+                "speaker_inversion_init_std must be >= 0, "
+                f"got {train_cfg.speaker_inversion_init_std}"
+            )
+        if train_cfg.speaker_inversion_uncond_std < 0:
+            raise ValueError(
+                "speaker_inversion_uncond_std must be >= 0, "
+                f"got {train_cfg.speaker_inversion_uncond_std}"
+            )
+        uncond_mode = str(train_cfg.speaker_inversion_uncond_mode).strip().lower()
+        if uncond_mode not in SPEAKER_INVERSION_UNCOND_MODES:
+            raise ValueError(
+                "speaker_inversion_uncond_mode must be one of "
+                f"{sorted(SPEAKER_INVERSION_UNCOND_MODES)}, got {uncond_mode!r}"
+            )
+        train_cfg = replace(train_cfg, speaker_inversion_uncond_mode=uncond_mode)
+        optimizer_explicit = cli_provided(raw_argv, "--optimizer") or (
+            isinstance(exp_cfg.get("train"), dict) and "optimizer" in exp_cfg.get("train", {})
+        )
+        if str(train_cfg.optimizer).strip().lower() == "muon":
+            if optimizer_explicit:
+                raise ValueError(
+                    "speaker_inversion_enabled=True supports optimizer='adamw'. "
+                    "Muon has no compatible matrix parameter when only speaker tokens are trainable."
+                )
+            train_cfg = replace(train_cfg, optimizer="adamw")
     if not (0.0 <= train_cfg.caption_condition_dropout <= 1.0):
         raise ValueError(
             "caption_condition_dropout must be in [0, 1], "
@@ -2631,6 +3031,29 @@ def main() -> None:
         raise ValueError("valid_every must be > 0 when valid_ratio > 0.")
     if train_cfg.valid_ratio == 0.0 and train_cfg.valid_every > 0 and is_main_process:
         print("warning: valid_every is set but valid_ratio=0. Validation is disabled.")
+    if train_cfg.speaker_similarity_valid_samples < 0:
+        raise ValueError(
+            "speaker_similarity_valid_samples must be >= 0, "
+            f"got {train_cfg.speaker_similarity_valid_samples}"
+        )
+    if train_cfg.speaker_similarity_num_steps <= 0:
+        raise ValueError(
+            "speaker_similarity_num_steps must be > 0, "
+            f"got {train_cfg.speaker_similarity_num_steps}"
+        )
+    if train_cfg.speaker_similarity_valid_samples > 0:
+        if train_cfg.valid_ratio <= 0.0 or train_cfg.valid_every <= 0:
+            raise ValueError(
+                "speaker_similarity_valid_samples > 0 requires validation to be enabled "
+                "(valid_ratio > 0 and valid_every > 0)."
+            )
+        if train_cfg.train_mode == "duration_only":
+            raise ValueError(
+                "speaker_similarity_valid_samples > 0 requires RF-capable validation; "
+                "train_mode='duration_only' is not supported."
+            )
+        if not str(train_cfg.speaker_similarity_model).strip():
+            raise ValueError("speaker_similarity_model must be non-empty.")
     if train_cfg.checkpoint_best_n < 0:
         raise ValueError(f"checkpoint_best_n must be >= 0, got {train_cfg.checkpoint_best_n}")
     if not (0.0 <= train_cfg.ema_decay < 1.0):
@@ -2760,7 +3183,9 @@ def main() -> None:
         latent_dim=model_cfg.latent_dim,
         max_latent_steps=train_cfg.max_latent_steps,
         enable_caption_condition=model_cfg.use_caption_condition,
-        enable_speaker_condition=model_cfg.use_speaker_condition,
+        enable_speaker_condition=(
+            model_cfg.use_speaker_condition and not train_cfg.speaker_inversion_enabled
+        ),
         enable_character_condition=model_cfg.use_character_condition,
         character_image_transform=character_image_transform,
         character_image_size=model_cfg.character_image_size,
@@ -2781,7 +3206,9 @@ def main() -> None:
             max_latent_steps=train_cfg.max_latent_steps,
             subset_indices=train_indices,
             enable_caption_condition=model_cfg.use_caption_condition,
-            enable_speaker_condition=model_cfg.use_speaker_condition,
+            enable_speaker_condition=(
+                model_cfg.use_speaker_condition and not train_cfg.speaker_inversion_enabled
+            ),
             enable_character_condition=model_cfg.use_character_condition,
             character_image_transform=character_image_transform,
             character_image_size=model_cfg.character_image_size,
@@ -2793,7 +3220,9 @@ def main() -> None:
             max_latent_steps=train_cfg.max_latent_steps,
             subset_indices=valid_indices,
             enable_caption_condition=model_cfg.use_caption_condition,
-            enable_speaker_condition=model_cfg.use_speaker_condition,
+            enable_speaker_condition=(
+                model_cfg.use_speaker_condition and not train_cfg.speaker_inversion_enabled
+            ),
             enable_character_condition=model_cfg.use_character_condition,
             character_image_transform=character_image_transform,
             character_image_size=model_cfg.character_image_size,
@@ -2829,6 +3258,13 @@ def main() -> None:
         )
     if not model_cfg.use_speaker_condition and is_main_process:
         print("Speaker conditioning disabled for caption-conditioned voice-design model.")
+    if train_cfg.speaker_inversion_enabled and is_main_process:
+        print(
+            "Speaker Inversion enabled: "
+            f"tokens={train_cfg.speaker_inversion_tokens} "
+            f"uncond_mode={train_cfg.speaker_inversion_uncond_mode} "
+            "base model will be frozen and checkpoints will contain only speaker embeddings."
+        )
     if train_cfg.caption_warmup and is_main_process:
         if not model_cfg.use_caption_condition:
             print(
@@ -2903,6 +3339,28 @@ def main() -> None:
     preview_codec = None
     if train_cfg.preview_every > 0 and parsed_previews and is_main_process:
         preview_codec = DACVAECodec.load(device=str(device))
+
+    speaker_similarity_codec = None
+    speaker_similarity_evaluator = None
+    if train_cfg.speaker_similarity_valid_samples > 0 and is_main_process:
+        speaker_similarity_codec = preview_codec
+        if speaker_similarity_codec is None:
+            speaker_similarity_codec = DACVAECodec.load(device=str(device))
+        similarity_device = (
+            str(device)
+            if train_cfg.speaker_similarity_device is None
+            else str(train_cfg.speaker_similarity_device)
+        )
+        speaker_similarity_evaluator = SpeakerSimilarityEvaluator(
+            source=train_cfg.speaker_similarity_model,
+            device=torch.device(similarity_device),
+        )
+        print(
+            "Validation speaker similarity enabled: "
+            f"samples={train_cfg.speaker_similarity_valid_samples} "
+            f"steps={train_cfg.speaker_similarity_num_steps} "
+            f"model={train_cfg.speaker_similarity_model} device={similarity_device}."
+        )
 
     has_validation = valid_loader is not None and train_cfg.valid_every > 0
     checkpoint_retention_enabled = train_cfg.checkpoint_best_n > 0
@@ -3005,6 +3463,36 @@ def main() -> None:
             f"trainable={trainable_params:,}/{total_params:,}"
         )
 
+    if train_cfg.speaker_inversion_enabled:
+        init_embedding = None
+        uncond_embedding = None
+        if train_cfg.speaker_inversion_init_embedding is not None:
+            init_payload = load_speaker_inversion_payload(
+                train_cfg.speaker_inversion_init_embedding,
+                model_cfg=model_cfg,
+            )
+            init_embedding = init_payload[SPEAKER_EMBEDDING_KEY]
+            uncond_embedding = init_payload.get(SPEAKER_UNCOND_EMBEDDING_KEY)
+            if is_main_process:
+                print(
+                    "Loaded Speaker Inversion init embedding: "
+                    f"{train_cfg.speaker_inversion_init_embedding}"
+                )
+        speaker_inversion = raw_model.enable_speaker_inversion(
+            num_tokens=train_cfg.speaker_inversion_tokens,
+            init_std=train_cfg.speaker_inversion_init_std,
+            uncond_mode=train_cfg.speaker_inversion_uncond_mode,
+            uncond_std=train_cfg.speaker_inversion_uncond_std,
+            init_embedding=init_embedding,
+            uncond_embedding=uncond_embedding,
+        )
+        speaker_inversion.to(device)
+        if is_main_process:
+            print(
+                "Speaker Inversion parameters initialized: "
+                f"embedding={tuple(speaker_inversion.embedding.shape)}."
+            )
+
     if train_cfg.trainable_modules is not None:
         compiled_trainable_module_specs = _compile_trainable_module_specs(
             train_cfg.trainable_modules
@@ -3054,6 +3542,15 @@ def main() -> None:
             print(
                 "Duration-only training enabled: "
                 f"trainable={trainable_duration_params:,} frozen={frozen_params:,}."
+            )
+    if train_cfg.speaker_inversion_enabled:
+        trainable_speaker_params, frozen_params = freeze_for_speaker_inversion(raw_model)
+        if trainable_speaker_params == 0:
+            raise RuntimeError("No Speaker Inversion parameters were found.")
+        if is_main_process:
+            print(
+                "Speaker Inversion freeze applied: "
+                f"trainable={trainable_speaker_params:,} frozen={frozen_params:,}."
             )
     train_model = raw_model
     if train_cfg.compile_model:
@@ -3230,9 +3727,16 @@ def main() -> None:
                 ref_latent = None
                 ref_mask = None
                 if raw_model.cfg.use_speaker_condition:
-                    ref_latent = batch["ref_latent_patched"].to(device, non_blocking=True)
-                    ref_mask = batch["ref_latent_mask_patched"].to(device, non_blocking=True)
-                    has_speaker = batch["has_speaker"].to(device, non_blocking=True)
+                    if train_cfg.speaker_inversion_enabled:
+                        has_speaker = torch.ones(
+                            (text_ids.shape[0],),
+                            dtype=torch.bool,
+                            device=device,
+                        )
+                    else:
+                        ref_latent = batch["ref_latent_patched"].to(device, non_blocking=True)
+                        ref_mask = batch["ref_latent_mask_patched"].to(device, non_blocking=True)
+                        has_speaker = batch["has_speaker"].to(device, non_blocking=True)
                 else:
                     has_speaker = None
 
@@ -3319,7 +3823,10 @@ def main() -> None:
                         duration_features,
                         duration_has_speaker,
                     )
-                    if not raw_model.cfg.use_duration_predictor:
+                    if (
+                        not raw_model.cfg.use_duration_predictor
+                        and not train_cfg.speaker_inversion_enabled
+                    ):
                         ref_mask = ref_mask & use_speaker[:, None]
                         ref_latent = ref_latent * use_speaker[:, None, None].to(ref_latent.dtype)
                 elif raw_model.cfg.use_character_condition:
@@ -3356,6 +3863,7 @@ def main() -> None:
                                 duration_features=duration_features,
                                 duration_has_speaker=duration_has_speaker,
                                 duration_only=True,
+                                detach_duration_condition=not train_cfg.speaker_inversion_enabled,
                             )
                             v_pred = None
                         elif raw_model.cfg.use_duration_predictor:
@@ -3375,6 +3883,7 @@ def main() -> None:
                                 caption_condition_dropout=caption_drop_for_model,
                                 duration_features=duration_features,
                                 duration_has_speaker=duration_has_speaker,
+                                detach_duration_condition=not train_cfg.speaker_inversion_enabled,
                             )
                         else:
                             v_pred = model(
@@ -3389,7 +3898,9 @@ def main() -> None:
                                 character_images=character_images,
                                 latent_mask=x_mask,
                                 text_condition_dropout=None,
-                                speaker_condition_dropout=None,
+                                speaker_condition_dropout=speaker_drop_for_model
+                                if train_cfg.speaker_inversion_enabled
+                                else None,
                                 caption_condition_dropout=None,
                             )
                             duration_pred = None
@@ -3623,11 +4134,14 @@ def main() -> None:
                     with _validation_model_context(ema, raw_model):
                         valid_metrics = run_validation(
                             model=model,
+                            sampling_model=raw_model,
                             loader=valid_loader,
                             train_cfg=train_cfg,
                             device=device,
                             use_bf16=use_bf16,
                             distributed=distributed,
+                            speaker_similarity_codec=speaker_similarity_codec,
+                            speaker_similarity_evaluator=speaker_similarity_evaluator,
                         )
                     optimizer_set_train_mode(optimizer, True)
                     if is_main_process:
@@ -3654,6 +4168,7 @@ def main() -> None:
                                     valid_metrics["duration_mae_frames_no_speaker"],
                                     valid_metrics["duration_samples_no_speaker"],
                                 )
+                            message = append_speaker_similarity_message(message, valid_metrics)
                             progress.write(
                                 "{} (samples={:.0f})".format(
                                     message,
@@ -3661,11 +4176,17 @@ def main() -> None:
                                 )
                             )
                         else:
-                            progress.write(
-                                ("valid step={} loss={:.6f} rf={:.6f} (samples={:.0f})").format(
+                            message = append_speaker_similarity_message(
+                                "valid step={} loss={:.6f} rf={:.6f}".format(
                                     step,
                                     valid_metrics["loss"],
                                     valid_metrics["rf_loss"],
+                                ),
+                                valid_metrics,
+                            )
+                            progress.write(
+                                "{} (samples={:.0f})".format(
+                                    message,
                                     valid_metrics["num_samples"],
                                 )
                             )
@@ -3702,6 +4223,7 @@ def main() -> None:
                                             ],
                                         }
                                     )
+                            add_speaker_similarity_wandb_metrics(metrics, valid_metrics)
                             wandb_run.log(metrics, step=step)
                         best_val_checkpoints, best_path = maybe_save_best_val_loss_checkpoint(
                             output_dir=output_dir,
@@ -3777,11 +4299,14 @@ def main() -> None:
             with _validation_model_context(ema, raw_model):
                 valid_metrics = run_validation(
                     model=model,
+                    sampling_model=raw_model,
                     loader=valid_loader,
                     train_cfg=train_cfg,
                     device=device,
                     use_bf16=use_bf16,
                     distributed=distributed,
+                    speaker_similarity_codec=speaker_similarity_codec,
+                    speaker_similarity_evaluator=speaker_similarity_evaluator,
                 )
             optimizer_set_train_mode(optimizer, True)
             if is_main_process:
@@ -3808,6 +4333,7 @@ def main() -> None:
                             valid_metrics["duration_mae_frames_no_speaker"],
                             valid_metrics["duration_samples_no_speaker"],
                         )
+                    message = append_speaker_similarity_message(message, valid_metrics)
                     progress.write(
                         "{} (samples={:.0f})".format(
                             message,
@@ -3815,11 +4341,17 @@ def main() -> None:
                         )
                     )
                 else:
-                    progress.write(
-                        ("valid final step={} loss={:.6f} rf={:.6f} (samples={:.0f})").format(
+                    message = append_speaker_similarity_message(
+                        "valid final step={} loss={:.6f} rf={:.6f}".format(
                             step,
                             valid_metrics["loss"],
                             valid_metrics["rf_loss"],
+                        ),
+                        valid_metrics,
+                    )
+                    progress.write(
+                        "{} (samples={:.0f})".format(
+                            message,
                             valid_metrics["num_samples"],
                         )
                     )
@@ -3854,6 +4386,7 @@ def main() -> None:
                                     ],
                                 }
                             )
+                    add_speaker_similarity_wandb_metrics(metrics, valid_metrics)
                     wandb_run.log(metrics, step=step)
                 best_val_checkpoints, best_path = maybe_save_best_val_loss_checkpoint(
                     output_dir=output_dir,

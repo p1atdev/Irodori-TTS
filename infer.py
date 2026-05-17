@@ -334,6 +334,11 @@ def main() -> None:
         "--ref-latent", default=None, help="Reference latent (.pt) path for speaker conditioning."
     )
     ref_group.add_argument(
+        "--speaker-embedding",
+        default=None,
+        help="Speaker Inversion embedding (.pt) path for speaker conditioning.",
+    )
+    ref_group.add_argument(
         "--no-ref",
         action="store_true",
         help="Run without speaker reference conditioning. Use this for voice-design checkpoints.",
@@ -357,10 +362,14 @@ def main() -> None:
         )
     )
     if runtime.model_cfg.use_speaker_condition and not (
-        args.no_ref or args.ref_wav is not None or args.ref_latent is not None
+        args.no_ref
+        or args.ref_wav is not None
+        or args.ref_latent is not None
+        or args.speaker_embedding is not None
     ):
         parser.error(
-            "speaker-conditioned checkpoints require one of --ref-wav, --ref-latent, or --no-ref."
+            "speaker-conditioned checkpoints require one of --ref-wav, --ref-latent, "
+            "--speaker-embedding, or --no-ref."
         )
 
     result = runtime.synthesize(
@@ -369,6 +378,7 @@ def main() -> None:
             caption=None if args.caption is None else str(args.caption),
             ref_wav=args.ref_wav,
             ref_latent=args.ref_latent,
+            speaker_embedding=args.speaker_embedding,
             no_ref=bool(args.no_ref),
             ref_normalize_db=args.ref_normalize_db,
             ref_ensure_max=bool(args.ref_ensure_max),

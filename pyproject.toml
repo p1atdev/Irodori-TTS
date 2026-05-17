@@ -29,6 +29,7 @@ dependencies = [
     "fastapi>=0.129.2",
     "scalar-fastapi>=1.8.2",
     "pydantic>=2.12.5",
+    "speechbrain>=1.1.0",
 ]
 
 

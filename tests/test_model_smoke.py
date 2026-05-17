@@ -131,6 +131,39 @@ def test_character_encoder_passes_timm_dropout_config(monkeypatch) -> None:
     assert captured_kwargs["drop_path_rate"] == 0.03
 
 
+def test_speaker_inversion_forward_bypasses_reference_encoder() -> None:
+    cfg = make_base_config()
+    model = TextToLatentRFDiT(cfg)
+    model.enable_speaker_inversion(
+        num_tokens=3,
+        init_std=0.01,
+        uncond_mode="noise",
+        uncond_std=0.02,
+    )
+    with torch.no_grad():
+        model.out_proj.weight.normal_(std=0.02)
+
+    x_t = torch.randn(2, 4, cfg.patched_latent_dim)
+    t = torch.full((2,), 0.5)
+    text_ids = torch.ones((2, 5), dtype=torch.long)
+    text_mask = torch.ones((2, 5), dtype=torch.bool)
+
+    out = model(
+        x_t=x_t,
+        t=t,
+        text_input_ids=text_ids,
+        text_mask=text_mask,
+        speaker_latent=None,
+        speaker_mask=None,
+        speaker_condition_dropout=torch.tensor([False, True]),
+    )
+    assert out.shape == x_t.shape
+
+    out.square().mean().backward()
+    assert model.speaker_inversion.embedding.grad is not None
+    assert model.speaker_encoder.in_proj.weight.grad is None
+
+
 def test_ccip_transform_uses_ccip_preprocess(monkeypatch) -> None:
     captured_kwargs = {}
     sentinel = object()

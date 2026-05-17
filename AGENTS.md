@@ -1,19 +1,36 @@
-# IrodoriTTS + Character Reference
+# IrodoriTTS + Speaker Inversion
 
-IrodoriTTS の基本機能 (README.md 参照) に加えて、画像を参照して生成する機能を実装する。
+音声参照のゼロショットの仕組みをベースにして、参照する音声埋め込みのみを学習する機能を作成する。
 
-## Character Reference
+イメージとしては Textual Inversion に近い。特定の長さ (16 など) のトークンのみを学習し、他はフリーズする。
+Voice Cloning は以下のような流れだが、
 
-現状、Voice Cloning (音声参照) やVoice Design (テキストキャプション) という機能で、テキストによって声のスタイルを指定することができるが、これと似たような形で、画像を参照として声のスタイルを決定する機能を実装。
+1. 音声VAE でエンコード
+2. Speaker Encoder に通す → 声のスタイル埋め込みを得る
+3. Joint Attention などに通す
+
+今回の Speaker Inversion では 1, 2 をスキップして声のスタイル埋め込みを得て、それを同様に Joint Attention や Duration Predictor に渡すことになる。
+
+uncond 条件は、attention mask によって attend しない方式と、ノイズ埋め込みを uncond として扱う方式の二つを用意して、選べるようにする。
+
+## 学習
+
+学習は通常の学習と同様、音声--テキストのペアを用いる。
+
+### 検証
+
+speechbrain の ECAPA-TDNN を用いた、話者類似度を指標にする。
+
+### preview
+
+学習中のプレビューでは学習した埋め込みを用いる。
+
+### モデル
+
+学習するのは声埋め込みなので、声埋め込みのみを保存する。
+推論時は声埋め込みファイルを指定して音声参照をできるようにする。
 
 # python
 
 python3 は使用できない。
 uv を使う。フォーマッタは ruff を使う。
-
-
-## Server
-
-FastAPI + OpenAPI + Scalar を使う。Scalar は以下参照:
-
-https://scalar.com/products/api-references/integrations/fastapi.md
