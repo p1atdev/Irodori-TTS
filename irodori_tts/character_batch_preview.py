@@ -176,7 +176,9 @@ class CharacterBatchPreviewStore:
                 return entry
         return None
 
-    def available_entries(self) -> list[PreviewEntry]:
+    def available_entries(self, *, verify_files: bool = True) -> list[PreviewEntry]:
+        if not verify_files:
+            return list(self.entries)
         return [entry for entry in self.entries if Path(entry.audio_path).is_file()]
 
     def upsert(self, entry: PreviewEntry) -> None:
@@ -582,11 +584,17 @@ def synthesize_character_batch(
     return generated, cached, messages
 
 
-def load_preview_entries(output_dir: str | Path = DEFAULT_OUTPUT_DIR) -> list[PreviewEntry]:
-    return CharacterBatchPreviewStore(output_dir).load().available_entries()
+def load_preview_entries(
+    output_dir: str | Path = DEFAULT_OUTPUT_DIR,
+    *,
+    verify_files: bool = True,
+) -> list[PreviewEntry]:
+    return (
+        CharacterBatchPreviewStore(output_dir).load().available_entries(verify_files=verify_files)
+    )
 
 
-def library_rows(entries: list[PreviewEntry], *, limit: int = 500) -> list[list[Any]]:
+def library_rows(entries: list[PreviewEntry], *, limit: int = 100) -> list[list[Any]]:
     sorted_entries = sorted(
         entries,
         key=lambda entry: (

@@ -38,6 +38,7 @@ model:
     depth: 1
     num_query_tokens: 16
     mlp_ratio: 2.6
+    dropout: 0.1
     qk_norm: true
     is_gated: true
   # Speaker encoder kept for architecture consistency but disabled via use_speaker_condition

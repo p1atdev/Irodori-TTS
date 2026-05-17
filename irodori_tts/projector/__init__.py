@@ -55,6 +55,7 @@ def build_projector(
             mlp_ratio=config.mlp_ratio,
             num_query_tokens=config.num_query_tokens,
             depth=config.depth,
+            dropout=config.dropout,
             gradient_checkpointing=config.gradient_checkpointing,
             qk_norm=config.qk_norm,
             is_gated=config.is_gated,

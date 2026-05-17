@@ -540,9 +540,11 @@ uv run python train.py \
 | `character_encoder_drop_path_rate` | timm 画像エンコーダ内の stochastic depth/drop path 率（default: `0.0`） |
 | `character_prepend_global_summary_token` | projector 後の画像 token 平均を global summary token として先頭に追加するか（default: `false`） |
 | `character_projector_split_duration_state` | projector の最終出力次元を2倍にして、生成用 state と duration 用 state に分割するか（default: `false`） |
-| `character_projector.type` | 画像特徴を音声モデル側に写すプロジェクタの種類（現状 `mlp`） |
-| `character_projector.hidden_dim` | プロジェクタの中間次元 |
-| `character_projector.num_layers` | **MLP ブロック数**。1ブロック = `Linear -> SiLU -> Linear` |
+| `character_projector.type` | 画像特徴を音声モデル側に写すプロジェクタの種類（`mlp` / `resampler`） |
+| `character_projector.hidden_dim` | `mlp` の中間次元 |
+| `character_projector.num_layers` | `mlp` のブロック数。1ブロック = `Linear -> SiLU -> Linear` |
+| `character_projector.dropout` | `resampler` の attention/MLP 残差にかける dropout 率（default: `0.0`） |
+| `character_projector.num_heads`, `depth`, `num_query_tokens`, `mlp_ratio` | `resampler` の attention head 数、ブロック数、query token 数、MLP 拡張率 |
 | `character_condition_dropout` | 画像条件付けのドロップアウト率 |
 | `character_unconditional_fill` | 画像なしサンプルや条件ドロップ時の埋め方（`zero` / `randn` / `rand`） |
 

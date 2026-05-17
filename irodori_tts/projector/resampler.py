@@ -13,6 +13,7 @@ class ResamplerProjectorConfig:
     mlp_ratio: float = 2.0
     num_query_tokens: int = 8
     depth: int = 4
+    dropout: float = 0.0
     gradient_checkpointing: bool = False
     qk_norm: bool = True
     is_gated: bool = False
@@ -101,6 +102,7 @@ class ResamplerBlock(nn.Module):
         dim: int,
         num_heads: int,
         mlp_ratio: float = 2.0,
+        dropout: float = 0.0,
         qk_norm: bool = True,
         is_gated: bool = False,
     ):
@@ -112,10 +114,11 @@ class ResamplerBlock(nn.Module):
             is_gated=is_gated,
         )
         self.mlp = _SwiGLU(dim=dim, hidden_dim=int(dim * mlp_ratio))
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, image_features: torch.Tensor, latents: torch.Tensor) -> torch.Tensor:
-        latents = latents + self.attn(image_features, latents)
-        latents = latents + self.mlp(latents)
+        latents = latents + self.dropout(self.attn(image_features, latents))
+        latents = latents + self.dropout(self.mlp(latents))
         return latents
 
 
@@ -129,6 +132,7 @@ class ResamplerProjector(nn.Module):
         mlp_ratio: float = 2.0,
         num_query_tokens: int = 8,
         depth: int = 4,
+        dropout: float = 0.0,
         gradient_checkpointing: bool = False,
         qk_norm: bool = True,
         is_gated: bool = False,
@@ -150,6 +154,7 @@ class ResamplerProjector(nn.Module):
                     dim=out_dim,
                     num_heads=num_heads,
                     mlp_ratio=mlp_ratio,
+                    dropout=dropout,
                     qk_norm=qk_norm,
                     is_gated=is_gated,
                 )

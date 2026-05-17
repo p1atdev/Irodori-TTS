@@ -203,7 +203,7 @@ only to continue an interrupted training run.
 | `speaker_dim`, `speaker_layers`, `speaker_heads`, `speaker_patch_size`, `speaker_mlp_ratio` | Reference/speaker encoder size. Ignored when caption conditioning disables speaker conditioning. |
 | `use_caption_condition` | Enables the VoiceDesign caption path and disables speaker/reference conditioning. |
 | `caption_*` fields | Caption encoder tokenizer and architecture. When left unset, many fields inherit the corresponding text settings. |
-| `use_character_condition`, `character_*` fields | Enable Character Reference image conditioning, including image encoder/projector settings, optional timm encoder dropout/drop path, and optional summary/duration-split character states. |
+| `use_character_condition`, `character_*` fields | Enable Character Reference image conditioning, including image encoder/projector settings, optional timm encoder dropout/drop path, resampler projector dropout, and optional summary/duration-split character states. |
 | `timestep_embed_dim`, `adaln_rank`, `norm_eps` | Diffusion conditioning and normalization parameters. |
 | `use_duration_predictor` | Enables v3 duration prediction. |
 | `duration_*` fields | Duration predictor architecture, hidden size, depth, dropout, speaker conditioning, and token-sum initialization. |

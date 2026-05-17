@@ -17,7 +17,8 @@ model:
   # character_encoder_model: ccip:ccip-caformer_b36-24 # 384
   # character_encoder_model: ccip:ccip-caformer-24-randaug-pruned  # lighter S36 variant
   character_encoder_model: hf_hub:SmilingWolf/wd-vit-tagger-v3
-  character_hidden_state_index: -5
+  character_hidden_state_index: -5 # null
+  # character_hidden_state_index: null
   # Training-time dropout/stochastic depth inside the timm image encoder.
   character_encoder_drop_rate: 0.05
   character_encoder_attn_drop_rate: 0.0
@@ -38,6 +39,7 @@ model:
     depth: 1
     num_query_tokens: 16
     mlp_ratio: 2.6
+    dropout: 0.1
     qk_norm: true
     is_gated: true
   # Speaker encoder kept for architecture consistency but disabled via use_speaker_condition
@@ -87,7 +89,7 @@ train:
   # stable_steps: 44000
   # min_lr_scale: 0.01
   adam_beta1: 0.9
-  adam_beta2: 0.99
+  adam_beta2: 0.999
   # adam_eps: 0.00000001
   # 
   max_steps: 20000
@@ -103,7 +105,7 @@ train:
   fixed_target_full_mask: false
   # 
   rf_loss_mode: utterance_mean
-  duration_loss_weight: 0.1
+  duration_loss_weight: 0.01
   duration_speaker_dropout: 0.0
   duration_huber_delta: 0.1
   # 

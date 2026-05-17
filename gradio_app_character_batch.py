@@ -12,7 +12,6 @@ from irodori_tts.character_batch_preview import (
     DEFAULT_OUTPUT_DIR,
     CharacterBatchGenerationSettings,
     PreviewEntry,
-    library_rows,
     load_preview_entries,
     synthesize_character_batch,
 )
@@ -23,18 +22,20 @@ from irodori_tts.inference_runtime import (
     list_available_runtime_precisions,
 )
 
-MAX_COMPARE_MODELS = 12
 LIBRARY_HEADERS = ["Created", "Model", "Image", "Line", "Text", "Seed", "Audio"]
 DETAIL_HEADERS = ["Model", "Created", "Audio", "Duration Decode", "Messages"]
 
 
 def _default_checkpoint() -> str:
-    candidates = sorted(
-        [
-            *Path(".").glob("**/checkpoint_*.pt"),
-            *Path(".").glob("**/checkpoint_*.safetensors"),
-        ]
-    )
+    candidates: list[Path] = []
+    for root in [Path("."), Path("outputs")]:
+        if not root.exists():
+            continue
+        candidates.extend(root.glob("checkpoint_*.pt"))
+        candidates.extend(root.glob("checkpoint_*.safetensors"))
+        candidates.extend(root.glob("*/checkpoint_*.pt"))
+        candidates.extend(root.glob("*/checkpoint_*.safetensors"))
+    candidates = sorted(set(candidates))
     preferred = [path for path in candidates if "character" in str(path).lower()]
     if preferred:
         return str(preferred[-1])
@@ -137,18 +138,37 @@ def _pair_entries(
     model_keys: list[str] | None,
 ) -> list[PreviewEntry]:
     allowed_models = set(model_keys or [])
+    if not allowed_models:
+        return []
     pair = [
         entry
         for entry in entries
         if entry.image_key == image_key
         and entry.line_key == line_key
-        and (not allowed_models or entry.model_key in allowed_models)
+        and entry.model_key in allowed_models
+        and Path(entry.audio_path).is_file()
     ]
     return sorted(pair, key=lambda entry: (entry.model_label.casefold(), entry.created_at))
 
 
-def _empty_audio_updates() -> list[object]:
-    return [gr.update(value=None, visible=False) for _ in range(MAX_COMPARE_MODELS)]
+def _audio_choice_label(entry: PreviewEntry) -> str:
+    return f"{entry.model_label} [{entry.model_key[:8]}] seed={entry.used_seed}"
+
+
+def _audio_choices(entries: list[PreviewEntry]) -> list[tuple[str, str]]:
+    return [(_audio_choice_label(entry), entry.cache_key) for entry in entries]
+
+
+def _selected_audio_entry(
+    entries: list[PreviewEntry],
+    selected_audio_key: str | None,
+) -> PreviewEntry | None:
+    if not entries:
+        return None
+    for entry in entries:
+        if entry.cache_key == selected_audio_key:
+            return entry
+    return entries[0]
 
 
 def _preview_values(
@@ -157,7 +177,8 @@ def _preview_values(
     image_key: str | None,
     line_key: str | None,
     model_keys: list[str] | None,
-) -> tuple[object, str, list[object], list[list[Any]]]:
+    selected_audio_key: str | None = None,
+) -> tuple[object, str, object, object, list[list[Any]]]:
     pair = _pair_entries(
         entries,
         image_key=image_key,
@@ -165,25 +186,21 @@ def _preview_values(
         model_keys=model_keys,
     )
     if not pair:
-        return gr.update(value=None, visible=False), "", _empty_audio_updates(), []
+        return (
+            gr.update(value=None, visible=False),
+            "",
+            gr.update(choices=[], value=None),
+            gr.update(value=None, visible=False),
+            [],
+        )
 
-    audio_updates: list[object] = []
-    for idx in range(MAX_COMPARE_MODELS):
-        if idx < len(pair):
-            entry = pair[idx]
-            audio_updates.append(
-                gr.update(
-                    value=entry.audio_path,
-                    label=f"{entry.model_label} [{entry.model_key[:8]}]",
-                    visible=True,
-                )
-            )
-        else:
-            audio_updates.append(gr.update(value=None, visible=False))
+    selected_entry = _selected_audio_entry(pair, selected_audio_key)
+    selected_audio_value = selected_entry.cache_key if selected_entry is not None else None
+    selected_audio_path = selected_entry.audio_path if selected_entry is not None else None
 
     detail_rows = [
         [
-            f"{entry.model_label} [{entry.model_key[:8]}]",
+            _audio_choice_label(entry),
             entry.created_at,
             entry.audio_path,
             f"{entry.total_to_decode:.3f}s",
@@ -194,87 +211,36 @@ def _preview_values(
     return (
         gr.update(value=pair[0].image_path, visible=True),
         pair[0].text,
-        audio_updates,
+        gr.update(choices=_audio_choices(pair), value=selected_audio_value),
+        gr.update(
+            value=selected_audio_path,
+            label=_audio_choice_label(selected_entry) if selected_entry is not None else "Audio",
+            visible=selected_entry is not None,
+        ),
         detail_rows,
     )
 
 
-def _library_state(
+def _load_library_metadata(
     output_dir: str | None,
-    *,
-    selected_models: list[str] | None = None,
-    selected_image: str | None = None,
-    selected_line: str | None = None,
-) -> tuple[
-    list[list[Any]],
-    object,
-    object,
-    object,
-    object,
-    str,
-    list[object],
-    list[list[Any]],
-    int,
-]:
-    entries = load_preview_entries(_output_dir(output_dir))
+    selected_models: list[str] | None,
+) -> tuple[object, ...]:
+    entries = load_preview_entries(_output_dir(output_dir), verify_files=False)
     model_choices = _model_choices(entries)
     model_values = _valid_values(model_choices, selected_models)
     image_choices = _image_choices(entries)
-    image_value = _selected_or_first(image_choices, selected_image)
-    line_choices = _line_choices(entries, image_value)
-    line_value = _selected_or_first(line_choices, selected_line)
-    image_preview, text_preview, audio_updates, detail_rows = _preview_values(
-        entries,
-        image_key=image_value,
-        line_key=line_value,
-        model_keys=model_values,
-    )
-    return (
-        library_rows(entries),
-        gr.update(choices=model_choices, value=model_values),
-        gr.update(choices=image_choices, value=image_value),
-        gr.update(choices=line_choices, value=line_value),
-        image_preview,
-        text_preview,
-        audio_updates,
-        detail_rows,
-        len(entries),
-    )
-
-
-def _refresh_library(
-    output_dir: str | None,
-    selected_models: list[str] | None,
-    selected_image: str | None,
-    selected_line: str | None,
-) -> tuple[object, ...]:
-    (
-        rows,
-        model_update,
-        image_update,
-        line_update,
-        image_preview,
-        text_preview,
-        audio_updates,
-        detail_rows,
-        entry_count,
-    ) = _library_state(
-        output_dir,
-        selected_models=selected_models,
-        selected_image=selected_image,
-        selected_line=selected_line,
-    )
-    status = f"loaded {entry_count} cached audio files from {_output_dir(output_dir)}"
+    status = f"loaded metadata for {len(entries)} cached audio files from {_output_dir(output_dir)}"
     return (
         status,
-        rows,
-        model_update,
-        image_update,
-        line_update,
-        image_preview,
-        text_preview,
-        *audio_updates,
-        detail_rows,
+        [],
+        gr.update(choices=model_choices, value=model_values),
+        gr.update(choices=image_choices, value=None),
+        gr.update(choices=[], value=None),
+        gr.update(value=None, visible=False),
+        "",
+        gr.update(choices=[], value=None),
+        gr.update(value=None, visible=False),
+        [],
     )
 
 
@@ -283,20 +249,22 @@ def _select_image(
     selected_image: str | None,
     selected_models: list[str] | None,
 ) -> tuple[object, ...]:
-    entries = load_preview_entries(_output_dir(output_dir))
+    entries = load_preview_entries(_output_dir(output_dir), verify_files=False)
     line_choices = _line_choices(entries, selected_image)
     line_value = _first_value(line_choices)
-    image_preview, text_preview, audio_updates, detail_rows = _preview_values(
+    image_preview, text_preview, audio_model_update, audio_update, detail_rows = _preview_values(
         entries,
         image_key=selected_image,
         line_key=line_value,
         model_keys=selected_models,
+        selected_audio_key=None,
     )
     return (
         gr.update(choices=line_choices, value=line_value),
         image_preview,
         text_preview,
-        *audio_updates,
+        audio_model_update,
+        audio_update,
         detail_rows,
     )
 
@@ -306,15 +274,41 @@ def _preview_pair(
     selected_image: str | None,
     selected_line: str | None,
     selected_models: list[str] | None,
+    selected_audio_key: str | None,
 ) -> tuple[object, ...]:
-    entries = load_preview_entries(_output_dir(output_dir))
-    image_preview, text_preview, audio_updates, detail_rows = _preview_values(
+    entries = load_preview_entries(_output_dir(output_dir), verify_files=False)
+    image_preview, text_preview, audio_model_update, audio_update, detail_rows = _preview_values(
+        entries,
+        image_key=selected_image,
+        line_key=selected_line,
+        model_keys=selected_models,
+        selected_audio_key=selected_audio_key,
+    )
+    return (image_preview, text_preview, audio_model_update, audio_update, detail_rows)
+
+
+def _load_selected_audio(
+    output_dir: str | None,
+    selected_image: str | None,
+    selected_line: str | None,
+    selected_models: list[str] | None,
+    selected_audio_key: str | None,
+) -> object:
+    entries = load_preview_entries(_output_dir(output_dir), verify_files=False)
+    pair = _pair_entries(
         entries,
         image_key=selected_image,
         line_key=selected_line,
         model_keys=selected_models,
     )
-    return (image_preview, text_preview, *audio_updates, detail_rows)
+    selected_entry = _selected_audio_entry(pair, selected_audio_key)
+    if selected_entry is None:
+        return gr.update(value=None, visible=False)
+    return gr.update(
+        value=selected_entry.audio_path,
+        label=_audio_choice_label(selected_entry),
+        visible=True,
+    )
 
 
 def _generate_batch(
@@ -327,11 +321,8 @@ def _generate_batch(
     model_precision: str,
     codec_device: str,
     codec_precision: str,
-    selected_models: list[str] | None,
-    selected_image: str | None,
-    selected_line: str | None,
     progress: gr.Progress = gr.Progress(),
-) -> tuple[object, ...]:
+) -> str:
     seed = _parse_seed(seed_raw)
 
     def log_fn(message: str) -> None:
@@ -358,50 +349,13 @@ def _generate_batch(
     )
     progress(1.0, desc="done")
 
-    preview_seed = generated[0] if generated else (cached[0] if cached else None)
-    image_value = selected_image
-    line_value = selected_line
-    if preview_seed is not None:
-        image_value = preview_seed.image_key
-        line_value = preview_seed.line_key
-    model_values = list(selected_models or [])
-    if preview_seed is not None and model_values and preview_seed.model_key not in model_values:
-        model_values.append(preview_seed.model_key)
-
-    (
-        rows,
-        model_update,
-        image_update,
-        line_update,
-        image_preview,
-        text_preview,
-        audio_updates,
-        detail_rows,
-        entry_count,
-    ) = _library_state(
-        output_dir,
-        selected_models=model_values,
-        selected_image=image_value,
-        selected_line=line_value,
-    )
-
     status_lines = [
         *messages,
         f"generated_now: {len(generated)}",
         f"cache_hits: {len(cached)}",
-        f"library_total: {entry_count}",
+        "library_selectors: press Refresh Library when you want to update selectors.",
     ]
-    return (
-        "\n".join(status_lines),
-        rows,
-        model_update,
-        image_update,
-        line_update,
-        image_preview,
-        text_preview,
-        *audio_updates,
-        detail_rows,
-    )
+    return "\n".join(status_lines)
 
 
 def _clear_runtime_cache() -> str:
@@ -489,21 +443,20 @@ def build_ui() -> gr.Blocks:
             )
             text_preview = gr.Textbox(label="Dialogue Text", lines=4, interactive=False, scale=2)
 
-        compare_audios: list[gr.Audio] = []
-        with gr.Column():
-            for row_idx in range(3):
-                with gr.Row():
-                    for col_idx in range(4):
-                        idx = row_idx * 4 + col_idx
-                        compare_audios.append(
-                            gr.Audio(
-                                label=f"Model {idx + 1}",
-                                type="filepath",
-                                interactive=False,
-                                visible=False,
-                                min_width=160,
-                            )
-                        )
+        with gr.Row():
+            audio_model_select = gr.Dropdown(
+                label="Audio Model",
+                choices=[],
+                value=None,
+                scale=2,
+            )
+            audio_preview = gr.Audio(
+                label="Audio",
+                type="filepath",
+                interactive=False,
+                visible=False,
+                scale=3,
+            )
 
         detail_table = gr.Dataframe(
             headers=DETAIL_HEADERS,
@@ -528,10 +481,17 @@ def build_ui() -> gr.Blocks:
             line_select,
             image_preview,
             text_preview,
-            *compare_audios,
+            audio_model_select,
+            audio_preview,
             detail_table,
         ]
-        preview_outputs = [image_preview, text_preview, *compare_audios, detail_table]
+        preview_outputs = [
+            image_preview,
+            text_preview,
+            audio_model_select,
+            audio_preview,
+            detail_table,
+        ]
 
         generate_btn.click(
             _generate_batch,
@@ -545,15 +505,12 @@ def build_ui() -> gr.Blocks:
                 model_precision,
                 codec_device,
                 codec_precision,
-                model_filter,
-                image_select,
-                line_select,
             ],
-            outputs=refresh_outputs,
+            outputs=[status],
         )
         refresh_btn.click(
-            _refresh_library,
-            inputs=[output_dir, model_filter, image_select, line_select],
+            _load_library_metadata,
+            inputs=[output_dir, model_filter],
             outputs=refresh_outputs,
         )
         image_select.change(
@@ -563,13 +520,24 @@ def build_ui() -> gr.Blocks:
         )
         line_select.change(
             _preview_pair,
-            inputs=[output_dir, image_select, line_select, model_filter],
+            inputs=[output_dir, image_select, line_select, model_filter, audio_model_select],
             outputs=preview_outputs,
         )
         model_filter.change(
             _preview_pair,
-            inputs=[output_dir, image_select, line_select, model_filter],
+            inputs=[output_dir, image_select, line_select, model_filter, audio_model_select],
             outputs=preview_outputs,
+        )
+        audio_model_select.change(
+            _load_selected_audio,
+            inputs=[
+                output_dir,
+                image_select,
+                line_select,
+                model_filter,
+                audio_model_select,
+            ],
+            outputs=[audio_preview],
         )
         model_device.change(
             _on_model_device_change,
@@ -584,8 +552,8 @@ def build_ui() -> gr.Blocks:
         clear_cache_btn.click(_clear_runtime_cache, outputs=[status])
 
         demo.load(
-            _refresh_library,
-            inputs=[output_dir, model_filter, image_select, line_select],
+            _load_library_metadata,
+            inputs=[output_dir, model_filter],
             outputs=refresh_outputs,
         )
 
